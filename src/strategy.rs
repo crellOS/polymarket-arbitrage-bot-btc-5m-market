@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
+use log::{warn, info, error, debug};
 
 pub struct PreLimitStrategy {
     api: Arc<PolymarketApi>,
@@ -18,6 +19,22 @@ pub struct PreLimitStrategy {
     states: Arc<Mutex<HashMap<String, PreLimitOrderState>>>,
     last_status_display: Arc<Mutex<std::time::Instant>>,
     total_profit: Arc<Mutex<f64>>,
+    trades: Arc<Mutex<HashMap<String, CycleTrade>>>,
+    closure_checked: Arc<Mutex<HashMap<String, bool>>>,
+    period_profit: Arc<Mutex<f64>>,
+}
+
+#[derive(Debug, Clone)]
+struct CycleTrade {
+    condition_id: String,
+    period_timestamp: u64,
+    market_duration_secs: u64,
+    up_token_id: Option<String>,
+    down_token_id: Option<String>,
+    up_shares: f64,
+    down_shares: f64,
+    up_avg_price: f64,
+    down_avg_price: f64,
 }
 
 impl PreLimitStrategy {
@@ -30,7 +47,18 @@ impl PreLimitStrategy {
             states: Arc::new(Mutex::new(HashMap::new())),
             last_status_display: Arc::new(Mutex::new(std::time::Instant::now())),
             total_profit: Arc::new(Mutex::new(0.0)),
+            trades: Arc::new(Mutex::new(HashMap::new())),
+            closure_checked: Arc::new(Mutex::new(HashMap::new())),
+            period_profit: Arc::new(Mutex::new(0.0)),
         }
+    }
+
+    pub async fn get_total_profit(&self) -> f64 {
+        *self.total_profit.lock().await
+    }
+
+    pub async fn get_period_profit(&self) -> f64 {
+        *self.period_profit.lock().await
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -89,10 +117,15 @@ impl PreLimitStrategy {
         let next_period_start = current_period_et + 3600;
         let time_until_next = next_period_start - current_time_et;
 
+        let needs_danger_handling = state.as_ref().map_or(false, |s| {
+            !s.merged && !s.risk_sold &&
+            ((s.up_matched && !s.down_matched) || (s.down_matched && !s.up_matched))
+        });
+
         if time_until_next <= (self.config.strategy.place_order_before_mins * 60) as i64 {
             let is_next_market_prepared = state.as_ref().map_or(false, |s| s.expiry == next_period_start + 3600);
             
-            if !is_next_market_prepared {
+            if !is_next_market_prepared && !needs_danger_handling {
                 // Signal check: evaluate current market before placing pre-orders for next
                 let signal = self.get_place_signal(asset, current_period_et).await;
                 if signal != MarketSignal::Good {
@@ -197,15 +230,14 @@ impl PreLimitStrategy {
                             profit_per_market, self.config.strategy.shares, current_total);
                         s.merged = true;
                     } else {
-                        if let Ok(_) = self.api.merge_positions(&s.condition_id, self.config.strategy.shares).await {
-                            let mut total = self.total_profit.lock().await;
-                            *total += profit_per_market;
-                            let current_total = *total;
-                            drop(total);
-                            log::info!("   💰 Profit locked in: ${:.2} ({} shares × $0.10) | Total Profit: ${:.2}", 
-                                profit_per_market, self.config.strategy.shares, current_total);
-                            s.merged = true;
-                        }
+                        log::info!("   Both matched for {}. TODO: Add redemption logic here.", asset);
+                        let mut total = self.total_profit.lock().await;
+                        *total += profit_per_market;
+                        let current_total = *total;
+                        drop(total);
+                        log::info!("   💰 Profit locked in: ${:.2} ({} shares × $0.10) | Total Profit: ${:.2}", 
+                            profit_per_market, self.config.strategy.shares, current_total);
+                        s.merged = true;
                     }
                 }
             }
@@ -465,6 +497,121 @@ impl PreLimitStrategy {
                 Ok(None)
             }
         }
+    }
+
+    pub async fn check_market_closure(&self) -> Result<()> {
+        let trades: Vec<(String, CycleTrade)> = {
+            let t = self.trades.lock().await;
+            t.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        if trades.is_empty() {
+            return Ok(());
+        }
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        for (market_key, trade) in trades {
+            let market_end = trade.period_timestamp + trade.market_duration_secs;
+            if current_time < market_end {
+                continue;
+            }
+
+            let checked = self.closure_checked.lock().await;
+            if checked.get(&trade.condition_id).copied().unwrap_or(false) {
+                drop(checked);
+                continue;
+            }
+            drop(checked);
+
+            let market = match self.api.get_market(&trade.condition_id).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("Failed to fetch market {}: {}", &trade.condition_id[..16], e);
+                    continue;
+                }
+            };
+            if !market.closed {
+                continue;
+            }
+
+            let up_wins = trade
+                .up_token_id
+                .as_ref()
+                .map(|id| market.tokens.iter().any(|t| t.token_id == *id && t.winner))
+                .unwrap_or(false);
+            let down_wins = trade
+                .down_token_id
+                .as_ref()
+                .map(|id| market.tokens.iter().any(|t| t.token_id == *id && t.winner))
+                .unwrap_or(false);
+
+            let total_cost = (trade.up_shares * trade.up_avg_price) + (trade.down_shares * trade.down_avg_price);
+            let payout = if up_wins {
+                trade.up_shares * 1.0
+            } else if down_wins {
+                trade.down_shares * 1.0
+            } else {
+                0.0
+            };
+            let pnl = payout - total_cost;
+
+            let winner = if up_wins { "Up" } else if down_wins { "Down" } else { "Unknown" };
+            eprintln!("=== Market resolved ===");
+            eprintln!(
+                "Market closed | condition {} | Winner: {} | Up {:.2} @ {:.4} | Down {:.2} @ {:.4} | Cost ${:.2} | Payout ${:.2} | Actual PnL ${:.2}",
+                &trade.condition_id[..16],
+                winner,
+                trade.up_shares,
+                trade.up_avg_price,
+                trade.down_shares,
+                trade.down_avg_price,
+                total_cost,
+                payout,
+                pnl
+            );
+
+            if !self.config.strategy.simulation_mode && (up_wins || down_wins) {
+                let (token_id, outcome) = if up_wins && trade.up_shares > 0.001 {
+                    (trade.up_token_id.as_deref().unwrap_or(""), "Up")
+                } else {
+                    (trade.down_token_id.as_deref().unwrap_or(""), "Down")
+                };
+                let _units = if up_wins { trade.up_shares } else { trade.down_shares };
+                if let Err(e) = self
+                    .api
+                    .redeem_tokens(&trade.condition_id, token_id, outcome)
+                    .await
+                {
+                    warn!("Redeem failed: {}", e);
+                }
+            }
+
+            {
+                let mut total = self.total_profit.lock().await;
+                *total += pnl;
+            }
+            {
+                let mut period = self.period_profit.lock().await;
+                *period += pnl;
+            }
+            let total_actual_pnl = *self.total_profit.lock().await;
+            eprintln!(
+                "  -> Actual PnL this market: ${:.2} | Total actual PnL (all time): ${:.2}",
+                pnl,
+                total_actual_pnl
+            );
+            {
+                let mut c = self.closure_checked.lock().await;
+                c.insert(trade.condition_id.clone(), true);
+            }
+            let mut t = self.trades.lock().await;
+            t.remove(&market_key);
+        }
+        Ok(())
     }
 
     fn round_price(price: f64) -> f64 {

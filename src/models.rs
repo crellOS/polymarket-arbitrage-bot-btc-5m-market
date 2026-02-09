@@ -65,10 +65,12 @@ pub struct OrderResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+
 pub struct RedeemResponse {
     pub success: bool,
     pub message: Option<String>,
     pub transaction_hash: Option<String>,
+    pub amount_redeemed: Option<String>,
 }
 
 #[derive(Debug, Clone)]

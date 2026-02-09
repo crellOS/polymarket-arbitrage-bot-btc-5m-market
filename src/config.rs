@@ -7,6 +7,12 @@ use std::path::PathBuf;
 pub struct Args {
     #[arg(short, long, default_value = "config.json")]
     pub config: PathBuf,
+
+    #[arg(long)]
+    pub redeem: bool,
+
+    #[arg(long, requires = "redeem")]
+    pub condition_id: Option<String>,
 }
 
 
@@ -29,6 +35,8 @@ pub struct StrategyConfig {
     pub signal: SignalConfig,
     #[serde(default = "default_sell_opposite_above")]
     pub sell_opposite_above: f64,
+    #[serde(default = "default_market_closure_check_interval_seconds")]
+    pub market_closure_check_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -56,6 +64,7 @@ fn default_clear_threshold() -> f64 { 0.99 }
 fn default_clear_remaining_mins() -> u64 { 15 }
 fn default_danger_price() -> f64 { 0.15 }
 fn default_sell_opposite_above() -> f64 { 0.95 }
+fn default_market_closure_check_interval_seconds() -> u64 { 120 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolymarketConfig {
@@ -91,6 +100,7 @@ impl Default for Config {
                 simulation_mode: false,
                 signal: SignalConfig::default(),
                 sell_opposite_above: 0.95,
+                market_closure_check_interval_seconds: 120,
             },
         }
     }

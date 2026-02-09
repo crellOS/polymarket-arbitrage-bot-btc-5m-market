@@ -13,6 +13,7 @@ use std::io::Write;
 use std::sync::Arc;
 use api::PolymarketApi;
 use strategy::PreLimitStrategy;
+use log::warn;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,6 +62,11 @@ async fn main() -> Result<()> {
         config.polymarket.signature_type,
     ));
 
+    if args.redeem {
+        run_redeem_only(api.as_ref(), &config, args.condition_id.as_deref()).await?;
+        return Ok(());
+    }
+
     if config.polymarket.private_key.is_some() {
         if let Err(e) = api.authenticate().await {
             log::error!("Authentication failed: {}", e);
@@ -70,8 +76,73 @@ async fn main() -> Result<()> {
         log::warn!("⚠️ No private key provided. Bot will only be able to monitor markets.");
     }
 
-    let strategy = PreLimitStrategy::new(api, config);
-    strategy.run().await?;
 
+    let market_closure_interval = config.strategy.market_closure_check_interval_seconds;
+    let strategy = Arc::new(PreLimitStrategy::new(api, config));
+    let strategy_for_closure = Arc::clone(&strategy);
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(market_closure_interval));
+        loop {
+            interval.tick().await;
+            if let Err(e) = strategy_for_closure.check_market_closure().await {
+                warn!("Error checking market closure: {}", e);
+            }
+            let total_profit = strategy_for_closure.get_total_profit().await;
+            let period_profit = strategy_for_closure.get_period_profit().await;
+            if total_profit != 0.0 || period_profit != 0.0 {
+                eprintln!("Current Profit - Period: ${:.2} | Total: ${:.2}", period_profit, total_profit);
+            }
+        }
+    });
+
+    strategy.run().await
+}
+
+    
+async fn run_redeem_only(
+    api: &PolymarketApi,
+    config: &Config,
+    condition_id: Option<&str>,
+) -> Result<()> {
+    let proxy = config
+        .polymarket
+        .proxy_wallet_address
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--redeem requires proxy_wallet_address in config.json"))?;
+
+    eprintln!("Redeem-only mode (proxy: {})", proxy);
+    let cids: Vec<String> = if let Some(cid) = condition_id {
+        let cid = if cid.starts_with("0x") { cid.to_string() } else { format!("0x{}", cid) };
+        eprintln!("Redeeming condition: {}", cid);
+        vec![cid]
+    } else {
+        eprintln!("Fetching redeemable positions...");
+        let list = api.get_redeemable_positions(proxy).await?;
+        if list.is_empty() {
+            eprintln!("No redeemable positions found.");
+            return Ok(());
+        }
+        eprintln!("Found {} condition(s) to redeem.", list.len());
+        list
+    };
+
+    let mut ok_count = 0u32;
+    let mut fail_count = 0u32;
+    for cid in &cids {
+        eprintln!("\n--- Redeeming condition {} ---", &cid[..cid.len().min(18)]);
+        match api.redeem_tokens(cid, "", "Up").await {
+            Ok(_) => {
+                eprintln!("Success: {}", cid);
+                ok_count += 1;
+            }
+            Err(e) => {
+                eprintln!("Failed to redeem {}: {} (skipping)", cid, e);
+                fail_count += 1;
+            }
+        }
+    }
+    eprintln!("\nRedeem complete. Succeeded: {}, Failed: {}", ok_count, fail_count);
     Ok(())
 }
+
