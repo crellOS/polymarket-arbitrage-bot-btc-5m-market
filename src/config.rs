@@ -5,7 +5,6 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
-    /// Configuration file path
     #[arg(short, long, default_value = "config.json")]
     pub config: PathBuf,
 }
@@ -19,15 +18,44 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyConfig {
-    pub price_limit: f64,             // $0.45
-    pub shares: f64,                  // 5 shares
-    pub place_order_before_mins: u64, // 3 mins
-    pub sell_unmatched_after_mins: u64, // 5 mins - sell unmatched positions after this time
-    pub check_interval_ms: u64,       // e.g. 5000
-    /// Simulation mode: If true, bot will log actions but not place real orders
+    pub price_limit: f64,
+    pub shares: f64,
+    pub place_order_before_mins: u64,
+    pub sell_unmatched_after_mins: u64,
+    pub check_interval_ms: u64,
     #[serde(default)]
     pub simulation_mode: bool,
+    #[serde(default)]
+    pub signal: SignalConfig,
+    #[serde(default = "default_sell_opposite_above")]
+    pub sell_opposite_above: f64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SignalConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_stable_min")]
+    pub stable_min: f64,
+    #[serde(default = "default_stable_max")]
+    pub stable_max: f64,
+    #[serde(default = "default_clear_threshold")]
+    pub clear_threshold: f64,
+    #[serde(default = "default_clear_remaining_mins")]
+    pub clear_remaining_mins: u64,
+    #[serde(default = "default_danger_price")]
+    pub danger_price: f64,
+    #[serde(default = "default_true")]
+    pub mid_market_enabled: bool,
+}
+
+fn default_true() -> bool { true }
+fn default_stable_min() -> f64 { 0.35 }
+fn default_stable_max() -> f64 { 0.65 }
+fn default_clear_threshold() -> f64 { 0.99 }
+fn default_clear_remaining_mins() -> u64 { 15 }
+fn default_danger_price() -> f64 { 0.15 }
+fn default_sell_opposite_above() -> f64 { 0.95 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolymarketConfig {
@@ -58,9 +86,11 @@ impl Default for Config {
                 price_limit: 0.45,
                 shares: 5.0,
                 place_order_before_mins: 3,
-                sell_unmatched_after_mins: 5,
+                sell_unmatched_after_mins: 57,
                 check_interval_ms: 2000,
                 simulation_mode: false,
+                signal: SignalConfig::default(),
+                sell_opposite_above: 0.95,
             },
         }
     }
@@ -79,4 +109,3 @@ impl Config {
         }
     }
 }
-

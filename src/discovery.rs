@@ -1,8 +1,16 @@
 use crate::api::PolymarketApi;
 use crate::models::Market;
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Datelike, TimeZone, Timelike};
+use chrono_tz::America::New_York;
 use std::sync::Arc;
+
+pub const ASSET_TO_SLUG: &[(&str, &str)] = &[
+    ("BTC", "bitcoin"),
+    ("ETH", "ethereum"),
+    ("SOL", "solana"),
+    ("XRP", "xrp"),
+];
 
 pub struct MarketDiscovery {
     api: Arc<PolymarketApi>,
@@ -13,46 +21,62 @@ impl MarketDiscovery {
         Self { api }
     }
 
-    /// Discover 15m markets for BTC, ETH, SOL, XRP
-    pub async fn discover_15m_markets(&self) -> Result<Vec<(String, Market)>> {
-        let assets = vec!["bitcoin", "ethereum", "solana", "ripple"];
-        let asset_names = vec!["BTC", "ETH", "SOL", "XRP"];
-        
-        let current_time = Utc::now().timestamp() as u64;
-        let period_start = (current_time / 900) * 900;
-        
-        let mut markets = Vec::new();
-        
-        for (idx, asset) in assets.iter().enumerate() {
-            let asset_name = asset_names[idx];
-            
-            // Try current and next period
-            for offset in 0..=1 {
-                let timestamp = period_start + (offset * 900);
-                let slug = format!("{}-updown-15m-{}", asset, timestamp);
-                
-                match self.api.get_market_by_slug(&slug).await {
-                    Ok(market) => {
-                        if market.active && !market.closed {
-                            markets.push((asset_name.to_string(), market));
-                            break; // Found one for this asset
-                        }
-                    }
-                    Err(_) => {
-                        // Try alternative slug format if needed
-                    }
-                }
-            }
-        }
-        
-        Ok(markets)
+    pub fn build_1h_slug(asset_slug: &str, period_start_et: i64) -> String {
+        let dt_et = New_York.timestamp_opt(period_start_et, 0).single().unwrap();
+        let month_str = match dt_et.month() {
+            1 => "january",
+            2 => "february",
+            3 => "march",
+            4 => "april",
+            5 => "may",
+            6 => "june",
+            7 => "july",
+            8 => "august",
+            9 => "september",
+            10 => "october",
+            11 => "november",
+            12 => "december",
+            _ => "january",
+        };
+        let day = dt_et.day();
+        let hour24 = dt_et.hour();
+        let (hour12, am_pm) = match hour24 {
+            0 => (12, "am"),
+            1..=11 => (hour24, "am"),
+            12 => (12, "pm"),
+            _ => (hour24 - 12, "pm"),
+        };
+        format!(
+            "{}-up-or-down-{}-{}-{}{}-et",
+            asset_slug, month_str, day, hour12, am_pm
+        )
+    }
+
+
+    pub fn current_1h_period_start_et() -> i64 {
+        let now_utc = chrono::Utc::now();
+        let now_et = now_utc.with_timezone(&New_York);
+
+        let hour_start_et = New_York
+            .with_ymd_and_hms(
+                now_et.year(),
+                now_et.month(),
+                now_et.day(),
+                now_et.hour(),
+                0,
+                0,
+            )
+            .single()
+            .unwrap();
+
+        hour_start_et.timestamp()
     }
 
     pub async fn get_market_tokens(&self, condition_id: &str) -> Result<(String, String)> {
         let details = self.api.get_market(condition_id).await?;
         let mut up_token = None;
         let mut down_token = None;
-        
+
         for token in details.tokens {
             let outcome = token.outcome.to_uppercase();
             if outcome.contains("UP") || outcome == "1" {
@@ -61,10 +85,10 @@ impl MarketDiscovery {
                 down_token = Some(token.token_id);
             }
         }
-        
+
         let up = up_token.ok_or_else(|| anyhow::anyhow!("Up token not found"))?;
         let down = down_token.ok_or_else(|| anyhow::anyhow!("Down token not found"))?;
-        
+
         Ok((up, down))
     }
 }

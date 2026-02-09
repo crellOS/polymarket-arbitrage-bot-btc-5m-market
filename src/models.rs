@@ -50,11 +50,11 @@ pub struct OrderBookEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
     pub token_id: String,
-    pub side: String, // "BUY" or "SELL"
+    pub side: String,
     pub size: String,
     pub price: String,
     #[serde(rename = "type")]
-    pub order_type: String, // "LIMIT" or "MARKET"
+    pub order_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,19 +73,21 @@ pub struct RedeemResponse {
 
 #[derive(Debug, Clone)]
 pub struct PreLimitOrderState {
-    pub asset: String,                // BTC, ETH, SOL, XRP
+    pub asset: String,
     pub condition_id: String,
     pub up_token_id: String,
     pub down_token_id: String,
     pub up_order_id: Option<String>,
     pub down_order_id: Option<String>,
+    pub up_order_price: f64,
+    pub down_order_price: f64,
     pub up_matched: bool,
     pub down_matched: bool,
     pub merged: bool,
-    pub expiry: i64,                  // Unix timestamp (market end time)
+    pub expiry: i64,
     pub risk_sold: bool,
-    pub order_placed_at: i64,         // When orders were placed (for simulation matching)
-    pub market_period_start: i64,    // The 15-minute period timestamp for the market where orders were placed
+    pub order_placed_at: i64,
+    pub market_period_start: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +97,6 @@ pub struct TokenPrice {
     pub ask: Option<Decimal>,
 }
 
-/// Fill/Trade structure from Polymarket Data API /activity endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fill {
     #[serde(rename = "tokenID")]

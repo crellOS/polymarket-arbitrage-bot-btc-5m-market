@@ -11,9 +11,9 @@ use log::{warn, error};
 use std::sync::Arc;
 
 // Official SDK imports for proper order signing
-use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
-use polymarket_client_sdk::clob::types::{Side, OrderType, SignatureType};
-use polymarket_client_sdk::POLYGON;
+use polymarket_clients_sdk::clob::{Client as ClobClient, Config as ClobConfig};
+use polymarket_clients_sdk::clob::types::{Side, OrderType, SignatureType};
+use polymarket_clients_sdk::POLYGON;
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer as _;
 use alloy::primitives::Address as AlloyAddress;
@@ -70,45 +70,36 @@ impl PolymarketApi {
         }
     }
     
-
-    /// Authenticate with Polymarket CLOB API at startup
-    /// This verifies credentials (private_key + API credentials)
-    /// Equivalent to JavaScript: new ClobClient(HOST, CHAIN_ID, signer, apiCreds, signatureType, funderAddress)
+    // Authenticate with Polymarket CLOB API
     pub async fn authenticate(&self) -> Result<()> {
-        // Check if we have required credentials
         let private_key = self.private_key.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Private key is required for authentication. Please set private_key in config.json"))?;
-        
-        // Create signer from private key (equivalent to: new Wallet(PRIVATE_KEY))
         let signer = LocalSigner::from_str(private_key)
             .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
             .with_chain_id(Some(POLYGON));
         
-        // Build authentication builder with proxy wallet support
         let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
             .context("Failed to create CLOB client")?
             .authentication_builder(&signer);
         
-        // Configure proxy wallet if provided
         if let Some(proxy_addr) = &self.proxy_wallet_address {
             let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
                 .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
             
             auth_builder = auth_builder.funder(funder_address);
             
-            // Set signature type based on config or default to Proxy
             let sig_type = match self.signature_type {
                 Some(1) => SignatureType::Proxy,
                 Some(2) => SignatureType::GnosisSafe,
                 Some(0) | None => {
-                    warn!("⚠️  proxy_wallet_address is set but signature_type is EOA. Defaulting to Proxy.");
+                    warn!("Proxy_wallet_address is set but signature_type is EOA. Defaulting to Proxy.");
                     SignatureType::Proxy
                 },
                 Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
             };
             
             auth_builder = auth_builder.signature_type(sig_type);
-            eprintln!("🔐 Using proxy wallet: {} (signature type: {:?})", proxy_addr, sig_type);
+            eprintln!("Using proxy wallet: {} (signature type: {:?})", proxy_addr, sig_type);
         } else if let Some(sig_type_num) = self.signature_type {
             // If signature type is set but no proxy wallet, validate it's EOA
             let sig_type = match sig_type_num {
@@ -119,17 +110,14 @@ impl PolymarketApi {
             auth_builder = auth_builder.signature_type(sig_type);
         }
         
-        // Authenticate (equivalent to: new ClobClient(HOST, CHAIN_ID, signer, apiCreds, signatureType, funderAddress))
-        // This verifies that both private_key and API credentials are valid
         let _client = auth_builder
             .authenticate()
             .await
             .context("Failed to authenticate with CLOB API. Check your API credentials (api_key, api_secret, api_passphrase) and private_key.")?;
         
-        // Mark as authenticated
         *self.authenticated.lock().await = true;
         
-        eprintln!("✅ Successfully authenticated with Polymarket CLOB API");
+        eprintln!("   ✓ Successfully authenticated with Polymarket CLOB API");
         eprintln!("   ✓ Private key: Valid");
         eprintln!("   ✓ API credentials: Valid");
         if let Some(proxy_addr) = &self.proxy_wallet_address {
@@ -201,62 +189,6 @@ impl PolymarketApi {
             .header("POLY_PASSPHRASE", self.api_passphrase.as_ref().unwrap());
         
         Ok(request)
-    }
-
-    /// Get all active markets (using events endpoint)
-    pub async fn get_all_active_markets(&self, limit: u32) -> Result<Vec<Market>> {
-        let url = format!("{}/events", self.gamma_url);
-        let limit_str = limit.to_string();
-        let mut params = HashMap::new();
-        params.insert("active", "true");
-        params.insert("closed", "false");
-        params.insert("limit", &limit_str);
-
-        let response = self
-            .client
-            .get(&url)
-            .query(&params)
-            .send()
-            .await
-            .context("Failed to fetch all active markets")?;
-
-        let status = response.status();
-        let json: Value = response.json().await.context("Failed to parse markets response")?;
-        
-        if !status.is_success() {
-            log::warn!("Get all active markets API returned error status {}: {}", status, serde_json::to_string(&json).unwrap_or_default());
-            anyhow::bail!("API returned error status {}: {}", status, serde_json::to_string(&json).unwrap_or_default());
-        }
-        
-        // Extract markets from events - events contain markets
-        let mut all_markets = Vec::new();
-        
-        if let Some(events) = json.as_array() {
-            for event in events {
-                if let Some(markets) = event.get("markets").and_then(|m| m.as_array()) {
-                    for market_json in markets {
-                        if let Ok(market) = serde_json::from_value::<Market>(market_json.clone()) {
-                            all_markets.push(market);
-                        }
-                    }
-                }
-            }
-        } else if let Some(data) = json.get("data") {
-            if let Some(events) = data.as_array() {
-                for event in events {
-                    if let Some(markets) = event.get("markets").and_then(|m| m.as_array()) {
-                        for market_json in markets {
-                            if let Ok(market) = serde_json::from_value::<Market>(market_json.clone()) {
-                                all_markets.push(market);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        log::debug!("Fetched {} active markets from events endpoint", all_markets.len());
-        Ok(all_markets)
     }
 
     /// Get market by slug (e.g., "btc-updown-15m-1767726000")
@@ -398,21 +330,11 @@ impl PolymarketApi {
         }
     }
 
-    /// Place an order using the official SDK with proper private key signing
-    /// 
-    /// This method uses the official polymarket-client-sdk to:
-    /// 1. Create signer from private key
-    /// 2. Authenticate with the CLOB API
-    /// 3. Create and sign the order
-    /// 4. Post the signed order
-    /// 
-    /// Equivalent to JavaScript: client.createAndPostOrder(userOrder)
+    // Place an order using the official SDK with proper private key signing
     pub async fn place_order(&self, order: &OrderRequest) -> Result<OrderResponse> {
-        // Check if we have a private key (required for signing)
         let private_key = self.private_key.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Please set private_key in config.json"))?;
         
-        // Create signer from private key (equivalent to: new Wallet(PRIVATE_KEY))
         let signer = LocalSigner::from_str(private_key)
             .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
             .with_chain_id(Some(POLYGON));
@@ -469,12 +391,13 @@ impl PolymarketApi {
         
         eprintln!("📤 Creating and posting order: {} {} {} @ {}", 
               order.side, order.size, order.token_id, order.price);
-        
-        // Create and post order using SDK (equivalent to: client.createAndPostOrder(userOrder))
-        // This automatically creates, signs, and posts the order
+
+        let token_id_u256 = U256::from_str_radix(order.token_id.trim_start_matches("0x"), 16)
+            .context(format!("Failed to parse token_id as U256: {}", order.token_id))?;
+
         let order_builder = client
             .limit_order()
-            .token_id(&order.token_id)
+            .token_id(token_id_u256)
             .size(size)
             .price(price)
             .side(side);
@@ -537,14 +460,7 @@ impl PolymarketApi {
         Ok(order_response)
     }
 
-    /// Place a market order (FOK/FAK) for immediate execution
-    /// 
-    /// This is used for emergency selling or when you want immediate execution at market price.
-    /// Equivalent to JavaScript: client.createAndPostMarketOrder(userMarketOrder)
-    /// 
-    /// Market orders execute immediately at the best available price:
-    /// - FOK (Fill-or-Kill): Order must fill completely or be cancelled
-    /// - FAK (Fill-and-Kill): Order fills as much as possible, remainder is cancelled
+    // Place a market order (FOK/FAK) for immediate execution
     pub async fn place_market_order(
         &self,
         token_id: &str,
@@ -640,12 +556,13 @@ impl PolymarketApi {
         };
         
         eprintln!("   Using current market price: ${:.4} for {} order", market_price, side);
-        
-        // Use limit order with aggressive pricing to simulate market order
-        // This ensures immediate execution at best available price
+
+        let token_id_u256 = U256::from_str_radix(token_id.trim_start_matches("0x"), 16)
+            .context(format!("Failed to parse token_id as U256: {}", token_id))?;
+
         let order_builder = client
             .limit_order()
-            .token_id(token_id)
+            .token_id(token_id_u256)
             .size(amount_decimal)
             .price(market_price)
             .side(side_enum);
@@ -654,17 +571,10 @@ impl PolymarketApi {
             .await
             .context("Failed to sign market order")?;
         
-        // For SELL orders, adjust price to be slightly below BID for immediate execution
-        // This ensures the order fills quickly (market sell should be aggressive)
-        // IMPORTANT: Polymarket requires prices to have at most 2 decimal places (tick size 0.01)
         let final_price = if matches!(side_enum, Side::Sell) {
-            // Use 0.5% below BID to ensure immediate fill (more aggressive)
-            // Convert to f64, adjust, then back to Decimal with proper rounding
             let price_f64 = f64::try_from(market_price).unwrap_or(0.0);
             let adjusted_f64 = price_f64 * 0.995;
-            // Round to 2 decimal places (Polymarket requirement: tick size 0.01)
             let rounded_f64 = (adjusted_f64 * 100.0).round() / 100.0;
-            // Ensure minimum price of 0.01
             let final_f64 = rounded_f64.max(0.01);
             Decimal::from_f64_retain(final_f64)
                 .ok_or_else(|| anyhow::anyhow!("Failed to convert adjusted price to Decimal"))?
@@ -681,7 +591,7 @@ impl PolymarketApi {
             eprintln!("   ⚠️  Adjusting SELL price from ${:.4} to ${:.4} for immediate execution", market_price_f64, final_price_f64);
             let adjusted_builder = client
                 .limit_order()
-                .token_id(token_id)
+                .token_id(token_id_u256)
                 .size(amount_decimal)
                 .price(final_price)
                 .side(side_enum);
@@ -814,10 +724,7 @@ impl PolymarketApi {
         Ok(())
     }
     
-    /// Place an order using REST API with HMAC authentication (fallback method)
-    /// 
-    /// NOTE: This is a fallback method. The main place_order() method uses the official SDK
-    /// with proper private key signing. Use this only if SDK integration fails.
+    // Place an order using REST API with HMAC authentication (fallback method)
     #[allow(dead_code)]
     async fn place_order_hmac(&self, order: &OrderRequest) -> Result<OrderResponse> {
         let path = "/orders";
@@ -984,278 +891,6 @@ impl PolymarketApi {
         } else {
             anyhow::bail!("mergePositions transaction failed. Transaction hash: {:?}", tx_hash);
         }
-    }
-
-    /// Get fills (executed trades) for a specific user account and optionally filter by condition_id
-    /// 
-    /// This endpoint returns all fills (executed trades) for a given user address.
-    /// Can optionally filter by condition_id to get trades for a specific market.
-    /// 
-    /// Parameters:
-    /// - user_address: Ethereum address of the user (with or without 0x prefix)
-    /// - condition_id: Optional condition ID to filter by specific market
-    /// - limit: Maximum number of fills to return (default: 1000)
-    /// 
-    /// Reference: Polymarket Data API - /activity endpoint
-    /// Documentation: https://docs.polymarket.com/developers/misc-endpoints/data-api-activity
-    /// Uses public Data API: https://data-api.polymarket.com/activity
-    pub async fn get_user_fills(
-        &self,
-        user_address: &str,
-        condition_id: Option<&str>,
-        limit: Option<u32>,
-    ) -> Result<Vec<crate::models::Fill>> {
-        // Use Data API for public trade history (not CLOB API)
-        // Data API: https://data-api.polymarket.com/activity
-        let data_api_url = "https://data-api.polymarket.com";
-        let url = format!("{}/activity", data_api_url);
-        
-        // Ensure user address has 0x prefix (API expects it)
-        let user_addr_formatted = if user_address.starts_with("0x") {
-            user_address.to_string()
-        } else {
-            format!("0x{}", user_address)
-        };
-        
-        // Set limit (default to 1000 if not specified)
-        let limit_val = limit.unwrap_or(1000);
-        
-        // Build params in the correct order: limit, sortBy, sortDirection, user, market
-        let mut params: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
-        params.insert("limit", limit_val.to_string());
-        params.insert("sortBy", "TIMESTAMP".to_string());
-        params.insert("sortDirection", "DESC".to_string());
-        params.insert("user", user_addr_formatted.clone());
-        
-        // Add market filter if condition_id is provided
-        if let Some(cond_id) = condition_id {
-            params.insert("market", cond_id.to_string());
-        }
-        
-        eprintln!("🔍 Fetching activity from Data API for user: {} (condition_id: {:?})", user_address, condition_id);
-        
-        // Build URL for logging in the correct order
-        let mut url_parts = vec![
-            format!("limit={}", limit_val),
-            "sortBy=TIMESTAMP".to_string(),
-            "sortDirection=DESC".to_string(),
-            format!("user={}", user_addr_formatted),
-        ];
-        if let Some(cond_id) = condition_id {
-            url_parts.push(format!("market={}", cond_id));
-        }
-        eprintln!("   URL: {}?{}", url, url_parts.join("&"));
-        
-        // Data API is public, no authentication required
-        let response = self
-            .client
-            .get(&url)
-            .query(&params)
-            .send()
-            .await
-            .context(format!("Failed to fetch activity for user: {}", user_address))?;
-        
-        let status = response.status();
-        if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Failed to fetch activity from Data API (status: {}): {}\n\
-                \n\
-                Troubleshooting:\n\
-                1. Verify the user address is correct: {}\n\
-                2. Verify the condition_id is correct: {:?}\n\
-                3. Check if the user has any trades in this market\n\
-                4. Try without condition_id to get all user activity",
-                status, error_text, user_address, condition_id
-            );
-        }
-        
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .context("Failed to parse activity response")?;
-        
-        eprintln!("   Response structure: {}", if json.is_array() { "array" } else { "object" });
-        
-        // Parse activity from response
-        // Data API /activity returns an array directly
-        let activities: Vec<serde_json::Value> = if let Some(activities_array) = json.as_array() {
-            activities_array.clone()
-        } else if let Some(activities_array) = json.get("data").and_then(|d| d.as_array()) {
-            activities_array.clone()
-        } else {
-            anyhow::bail!("Unexpected response format: expected array of activities");
-        };
-        
-        // Filter to only TRADE type activities and convert to Fill structs
-        let fills: Vec<crate::models::Fill> = activities
-            .into_iter()
-            .filter_map(|activity| {
-                // Only process TRADE type activities
-                if activity.get("type").and_then(|t| t.as_str()) != Some("TRADE") {
-                    return None;
-                }
-                
-                // Convert activity to Fill
-                serde_json::from_value::<crate::models::Fill>(activity).ok()
-            })
-            .collect();
-        
-        eprintln!("✅ Fetched {} trades from {} total activities for user: {}", 
-                  fills.len(), json.as_array().map(|a| a.len()).unwrap_or(0), user_address);
-        
-        Ok(fills)
-    }
-
-    /// Get fills for a specific market (condition_id) by fetching market tokens first
-    /// 
-    /// This method:
-    /// 1. Fetches market details to get Up and Down token IDs
-    /// 2. Fetches fills for the user
-    /// 3. Filters fills to only include tokens from this market
-    pub async fn get_user_fills_for_market(
-        &self,
-        user_address: &str,
-        condition_id: &str,
-        limit: Option<u32>,
-    ) -> Result<Vec<crate::models::Fill>> {
-        // First, get market details to find token IDs
-        let market = self.get_market(condition_id).await
-            .context(format!("Failed to fetch market for condition_id: {}", condition_id))?;
-        
-        // Extract token IDs from market
-        let market_token_ids: std::collections::HashSet<String> = market.tokens
-            .iter()
-            .map(|t| t.token_id.clone())
-            .collect();
-        
-        eprintln!("📊 Market has {} tokens: {:?}", market_token_ids.len(), market_token_ids);
-        
-        // Fetch fills for user filtered by this market's condition_id
-        let all_fills = self.get_user_fills(user_address, Some(condition_id), limit).await?;
-        
-        // Filter fills to only include tokens from this market
-        // Data API returns conditionId in the fill, so we can filter by that
-        let market_fills: Vec<crate::models::Fill> = all_fills
-            .into_iter()
-            .filter(|fill| {
-                // Filter by condition_id if available
-                if let Some(fill_cond_id) = &fill.condition_id {
-                    if fill_cond_id == condition_id {
-                        return true;
-                    }
-                }
-                // Fallback: filter by token_id matching market tokens
-                if let Some(token_id) = &fill.token_id {
-                    market_token_ids.contains(token_id)
-                } else {
-                    false
-                }
-            })
-            .collect();
-        
-        eprintln!("✅ Found {} fills for market {} (condition_id: {})", 
-                  market_fills.len(), market.question, condition_id);
-        
-        Ok(market_fills)
-    }
-    
-    /// Alternative method: Fetch fills by fetching market tokens and querying by token_id
-    /// This is a workaround if the /fills endpoint doesn't work
-    async fn get_user_fills_by_token_ids(
-        &self,
-        _user_address: &str,
-        condition_id: &str,
-        limit: Option<u32>,
-    ) -> Result<Vec<crate::models::Fill>> {
-        eprintln!("   Trying alternative: Fetch fills by token IDs from market...");
-        
-        // Get market to find token IDs
-        let market = self.get_market(condition_id).await
-            .context(format!("Failed to fetch market for condition_id: {}", condition_id))?;
-        
-        let market_token_ids: Vec<String> = market.tokens
-            .iter()
-            .map(|t| t.token_id.clone())
-            .collect();
-        
-        eprintln!("   Found {} tokens in market, trying to fetch fills by token_id...", market_token_ids.len());
-        
-        // Try fetching fills for each token
-        let mut all_fills = Vec::new();
-        for token_id in &market_token_ids {
-            let url = format!("{}/fills", self.clob_url);
-            let mut params: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
-            params.insert("tokenID", token_id.clone());
-            
-            if let Some(limit_val) = limit {
-                params.insert("limit", limit_val.to_string());
-            }
-            
-            let mut request_builder = self.client.get(&url).query(&params);
-            
-            // Try with auth if available
-            if self.api_key.is_some() && self.api_secret.is_some() && self.api_passphrase.is_some() {
-                let path = "/fills";
-                let body = "";
-                match self.add_auth_headers(request_builder, "GET", path, body) {
-                    Ok(auth_request) => request_builder = auth_request,
-                    Err(_) => {
-                        // If auth fails, continue without auth
-                        request_builder = self.client.get(&url).query(&params);
-                    }
-                }
-            }
-            
-            if let Ok(resp) = request_builder.send().await {
-                if resp.status().is_success() {
-                    if let Ok(json) = resp.json::<serde_json::Value>().await {
-                        let fills: Vec<crate::models::Fill> = if let Some(fills_array) = json.as_array() {
-                            serde_json::from_value(serde_json::Value::Array(fills_array.clone()))
-                                .unwrap_or_default()
-                        } else if let Some(fills_array) = json.get("fills").and_then(|f| f.as_array()) {
-                            serde_json::from_value(serde_json::Value::Array(fills_array.clone()))
-                                .unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
-                        
-                        // Filter by condition_id (since Fill struct doesn't have user/maker/taker fields)
-                        // In a real implementation, you'd need to check the actual fill data structure
-                        let user_fills: Vec<crate::models::Fill> = fills
-                            .into_iter()
-                            .filter(|fill| {
-                                // Filter by condition_id if it matches
-                                if let Some(fill_cond_id) = &fill.condition_id {
-                                    fill_cond_id == condition_id
-                                } else {
-                                    false
-                                }
-                            })
-                            .collect();
-                        
-                        all_fills.extend(user_fills);
-                    }
-                }
-            }
-        }
-        
-        if all_fills.is_empty() {
-            anyhow::bail!(
-                "Could not fetch fills using any method. Possible reasons:\n\
-                1. The user has no trades in this market\n\
-                2. The /fills endpoint requires authentication (set API credentials in config.json)\n\
-                3. The endpoint format has changed\n\
-                \n\
-                Try:\n\
-                - Verify the user address is correct\n\
-                - Check if API credentials are needed\n\
-                - Verify the condition_id is correct"
-            );
-        }
-        
-        eprintln!("✅ Found {} fills using token_id filtering", all_fills.len());
-        Ok(all_fills)
     }
 }
 

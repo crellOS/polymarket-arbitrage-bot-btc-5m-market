@@ -2,7 +2,7 @@ module.exports = {
   apps: [{
     name: 'polymarket-bot',
     script: './target/release/polymarket-arbitrage-bot',
-    cwd: '/root/rust-pro/polymarket-arbitrage-bot-ultra',
+    cwd: '/root/rust-pro/polymarket-arbitrage-bot-pre-order',
     instances: 1,
     autorestart: true,
     watch: false,
