@@ -60,7 +60,7 @@ A high-performance **Rust** arbitrage bot for [Polymarket](https://polymarket.co
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/polymarket-trading-bot-btc-5m-market.git
+git clone https://github.com/crellos/polymarket-trading-bot-btc-5m-market.git
 cd polymarket-trading-bot-btc-5m-market
 cargo build --release
 ```
@@ -81,7 +81,7 @@ Copy or create `config.json` in the project root. Structure:
     "api_key": "YOUR_API_KEY",
     "api_secret": "YOUR_API_SECRET",
     "api_passphrase": "YOUR_PASSPHRASE",
-    "private_key": "YOUR_POLYGON_PRIVATE_KEY_HEX",
+    "private_key": "YOUR_POLYGON_PRIVATE_KEY_HEX", //consider about signature type carefully
     "proxy_wallet_address": "0x...",
     "signature_type": 2,
     "ws_url": "wss://ws-subscriptions-clob.polymarket.com"
@@ -156,7 +156,7 @@ This bot is for **educational and research purposes**. Polymarket and crypto pre
 
 ## Contact
 
-- **Telegram:** [crell_0x](https://t.me/crell_0x) (crellOS)
+- **Telegram:** [crellos_0x](https://t.me/crellos_0x) (crellOS)
 
 ---
 
