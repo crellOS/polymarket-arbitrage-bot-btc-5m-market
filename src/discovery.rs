@@ -1,16 +1,64 @@
 use crate::api::PolymarketApi;
-use crate::models::Market;
 use anyhow::Result;
-use chrono::{Datelike, TimeZone, Timelike};
-use chrono_tz::America::New_York;
 use std::sync::Arc;
 
-pub const ASSET_TO_SLUG: &[(&str, &str)] = &[
-    ("BTC", "bitcoin"),
-    ("ETH", "ethereum"),
-    ("SOL", "solana"),
-    ("XRP", "xrp"),
-];
+pub const MARKET_15M_DURATION_SECS: i64 = 15 * 60; // 900
+pub const MARKET_5M_DURATION_SECS: i64 = 5 * 60;  // 300
+
+/// BTC 15m slug: btc-updown-15m-{timestamp}
+pub fn build_15m_slug(period_start_unix: i64) -> String {
+    format!("btc-updown-15m-{}", period_start_unix)
+}
+
+/// BTC 5m slug: btc-updown-5m-{timestamp}
+pub fn build_5m_slug(period_start_unix: i64) -> String {
+    format!("btc-updown-5m-{}", period_start_unix)
+}
+
+/// Current 15-minute period start (Unix, aligned to 15m boundaries).
+pub fn current_15m_period_start() -> i64 {
+    let now = chrono::Utc::now().timestamp();
+    (now / MARKET_15M_DURATION_SECS) * MARKET_15M_DURATION_SECS
+}
+
+/// Current 5-minute period start (Unix, aligned to 5m boundaries).
+pub fn current_5m_period_start() -> i64 {
+    let now = chrono::Utc::now().timestamp();
+    (now / MARKET_5M_DURATION_SECS) * MARKET_5M_DURATION_SECS
+}
+
+/// True when we're in the last 5 minutes of the current 15m market (overlap with 5m for arb).
+pub fn is_last_5min_of_15m(now_ts: i64, period_15m_start: i64) -> bool {
+    let elapsed = now_ts - period_15m_start;
+    elapsed >= 10 * 60 && elapsed < 15 * 60 // 600..900 sec
+}
+
+/// Parse price-to-beat from market question (e.g. "Will Bitcoin be above $97,500 at ...").
+pub fn parse_price_to_beat_from_question(question: &str) -> Option<f64> {
+    let q = question.to_lowercase();
+    let idx = q.find("above ").or_else(|| q.find('$'))?;
+    let after = &question[idx..];
+    let mut num_start_byte = 0;
+    for (i, c) in after.char_indices() {
+        if c == '$' || c.is_ascii_digit() {
+            num_start_byte = if c == '$' {
+                i + c.len_utf8()
+            } else {
+                i
+            };
+            break;
+        }
+    }
+    let num_str: String = after[num_start_byte..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
+        .filter(|c| *c != ',')
+        .collect();
+    if num_str.is_empty() {
+        return None;
+    }
+    num_str.parse::<f64>().ok()
+}
 
 pub struct MarketDiscovery {
     api: Arc<PolymarketApi>,
@@ -19,57 +67,6 @@ pub struct MarketDiscovery {
 impl MarketDiscovery {
     pub fn new(api: Arc<PolymarketApi>) -> Self {
         Self { api }
-    }
-
-    pub fn build_1h_slug(asset_slug: &str, period_start_et: i64) -> String {
-        let dt_et = New_York.timestamp_opt(period_start_et, 0).single().unwrap();
-        let month_str = match dt_et.month() {
-            1 => "january",
-            2 => "february",
-            3 => "march",
-            4 => "april",
-            5 => "may",
-            6 => "june",
-            7 => "july",
-            8 => "august",
-            9 => "september",
-            10 => "october",
-            11 => "november",
-            12 => "december",
-            _ => "january",
-        };
-        let day = dt_et.day();
-        let hour24 = dt_et.hour();
-        let (hour12, am_pm) = match hour24 {
-            0 => (12, "am"),
-            1..=11 => (hour24, "am"),
-            12 => (12, "pm"),
-            _ => (hour24 - 12, "pm"),
-        };
-        format!(
-            "{}-up-or-down-{}-{}-{}{}-et",
-            asset_slug, month_str, day, hour12, am_pm
-        )
-    }
-
-
-    pub fn current_1h_period_start_et() -> i64 {
-        let now_utc = chrono::Utc::now();
-        let now_et = now_utc.with_timezone(&New_York);
-
-        let hour_start_et = New_York
-            .with_ymd_and_hms(
-                now_et.year(),
-                now_et.month(),
-                now_et.day(),
-                now_et.hour(),
-                0,
-                0,
-            )
-            .single()
-            .unwrap();
-
-        hour_start_et.timestamp()
     }
 
     pub async fn get_market_tokens(&self, condition_id: &str) -> Result<(String, String)> {
@@ -90,5 +87,33 @@ impl MarketDiscovery {
         let down = down_token.ok_or_else(|| anyhow::anyhow!("Down token not found"))?;
 
         Ok((up, down))
+    }
+
+    /// Fetch BTC 15m market by period start; returns condition_id and price-to-beat if parseable.
+    pub async fn get_15m_market(&self, period_start: i64) -> Result<Option<(String, Option<f64>)>> {
+        let slug = build_15m_slug(period_start);
+        let market = match self.api.get_market_by_slug(&slug).await {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        if !market.active || market.closed {
+            return Ok(None);
+        }
+        let price_to_beat = parse_price_to_beat_from_question(&market.question);
+        Ok(Some((market.condition_id, price_to_beat)))
+    }
+
+    /// Fetch BTC 5m market by period start; returns condition_id and price-to-beat if parseable.
+    pub async fn get_5m_market(&self, period_start: i64) -> Result<Option<(String, Option<f64>)>> {
+        let slug = build_5m_slug(period_start);
+        let market = match self.api.get_market_by_slug(&slug).await {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        if !market.active || market.closed {
+            return Ok(None);
+        }
+        let price_to_beat = parse_price_to_beat_from_question(&market.question);
+        Ok(Some((market.condition_id, price_to_beat)))
     }
 }

@@ -1,617 +1,289 @@
+//! 15m vs 5m BTC arbitrage: only in last 5 min of 15m when price-to-beat matches;
+//! monitor via WebSocket; place both sides when sum of asks < threshold.
+//! After 10s: verify both filled; if only one side matched, sell that token and cancel the other order.
+
 use crate::api::PolymarketApi;
 use crate::config::Config;
-use crate::discovery::{MarketDiscovery, ASSET_TO_SLUG};
-use crate::models::*;
-use crate::signals::{self, MarketSignal};
+use crate::discovery::{
+    current_15m_period_start, current_5m_period_start, is_last_5min_of_15m,
+    MarketDiscovery, MARKET_15M_DURATION_SECS, MARKET_5M_DURATION_SECS,
+};
+use crate::models::{OrderRequest, OrderResponse};
+use crate::ws::{run_market_ws, PricesSnapshot};
 use anyhow::Result;
-use chrono::Utc;
-use chrono_tz::America::New_York;
-use std::collections::HashMap;
+use chrono::{TimeZone, Utc};
+use log::{error, info, warn};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
-use log::{warn, info, error, debug};
 
-pub struct PreLimitStrategy {
+fn format_timestamp_iso(unix_secs: i64) -> String {
+    Utc.timestamp_opt(unix_secs, 0)
+        .single()
+        .map(|dt: chrono::DateTime<_>| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// Returns (filled_a, filled_b). In simulation mode assumes both filled.
+async fn check_fill_status(
+    api: &PolymarketApi,
+    order_id_a: Option<&str>,
+    order_id_b: Option<&str>,
+    sim: bool,
+) -> (bool, bool) {
+    if sim {
+        return (true, true);
+    }
+    let ok_a = match order_id_a {
+        Some(id) => api.get_order_status(id).await.ok(),
+        None => None,
+    };
+    let ok_b = match order_id_b {
+        Some(id) => api.get_order_status(id).await.ok(),
+        None => None,
+    };
+    let filled_a = ok_a
+        .and_then(|s| {
+            let o: f64 = s.original_size.as_deref()?.parse().ok()?;
+            let m: f64 = s.size_matched.as_deref()?.parse().ok()?;
+            Some(o > 0.0 && m >= o - 0.001)
+        })
+        .unwrap_or(false);
+    let filled_b = ok_b
+        .and_then(|s| {
+            let o: f64 = s.original_size.as_deref()?.parse().ok()?;
+            let m: f64 = s.size_matched.as_deref()?.parse().ok()?;
+            Some(o > 0.0 && m >= o - 0.001)
+        })
+        .unwrap_or(false);
+    (filled_a, filled_b)
+}
+
+/// Parameters for verify-and-manage-risk: one arb leg (token A + token B and their order IDs).
+struct VerifyRiskParams {
+    token_a: String,
+    token_b: String,
+    order_id_a: Option<String>,
+    order_id_b: Option<String>,
+    shares: f64,
+    verify_secs: u64,
+    simulation: bool,
+    label_a: String,
+    label_b: String,
+}
+
+/// After verify_secs: confirm both filled; if only one filled, sell that token and cancel the other order.
+async fn verify_and_manage_risk(api: Arc<PolymarketApi>, p: VerifyRiskParams) {
+    sleep(Duration::from_secs(p.verify_secs)).await;
+    let (filled_a, filled_b) = check_fill_status(
+        &api,
+        p.order_id_a.as_deref(),
+        p.order_id_b.as_deref(),
+        p.simulation,
+    )
+    .await;
+
+    if filled_a && filled_b {
+        info!(
+            "Both orders confirmed filled ({} + {}). Ready for next opportunity.",
+            p.label_a, p.label_b
+        );
+        return;
+    }
+
+    if filled_a && !filled_b {
+        warn!(
+            "Only {} matched after {}s. Risk exit: selling {} and cancelling {} order.",
+            p.label_a, p.verify_secs, p.label_a, p.label_b
+        );
+        if p.simulation {
+            info!(
+                "🎮 SIMULATION: Would sell {} shares {} and cancel {} order",
+                p.shares, p.label_a, p.label_b
+            );
+        } else {
+            if let Err(e) = api.place_market_order(&p.token_a, p.shares, "SELL", None).await {
+                error!("Failed to sell {}: {}", p.label_a, e);
+            } else {
+                info!("Sold {} shares {}", p.shares, p.label_a);
+            }
+            if let Some(ref id) = p.order_id_b {
+                if let Err(e) = api.cancel_order(id).await {
+                    error!("Failed to cancel {} order: {}", p.label_b, e);
+                } else {
+                    info!("Cancelled {} order", p.label_b);
+                }
+            }
+        }
+        return;
+    }
+
+    if !filled_a && filled_b {
+        warn!(
+            "Only {} matched after {}s. Risk exit: selling {} and cancelling {} order.",
+            p.label_b, p.verify_secs, p.label_b, p.label_a
+        );
+        if p.simulation {
+            info!(
+                "🎮 SIMULATION: Would sell {} shares {} and cancel {} order",
+                p.shares, p.label_b, p.label_a
+            );
+        } else {
+            if let Err(e) = api.place_market_order(&p.token_b, p.shares, "SELL", None).await {
+                error!("Failed to sell {}: {}", p.label_b, e);
+            } else {
+                info!("Sold {} shares {}", p.shares, p.label_b);
+            }
+            if let Some(ref id) = p.order_id_a {
+                if let Err(e) = api.cancel_order(id).await {
+                    error!("Failed to cancel {} order: {}", p.label_a, e);
+                } else {
+                    info!("Cancelled {} order", p.label_a);
+                }
+            }
+        }
+        return;
+    }
+
+    warn!(
+        "Neither order matched after {}s. Cancelling both {} and {} orders.",
+        p.verify_secs, p.label_a, p.label_b
+    );
+    if !p.simulation {
+        if let Some(ref id) = p.order_id_a {
+            let _ = api.cancel_order(id).await;
+        }
+        if let Some(ref id) = p.order_id_b {
+            let _ = api.cancel_order(id).await;
+        }
+    }
+}
+
+/// Token IDs: 15m Up, 15m Down, 5m Up, 5m Down.
+pub struct ArbTokens {
+    pub m15_up: String,
+    pub m15_down: String,
+    pub m5_up: String,
+    pub m5_down: String,
+}
+
+pub struct ArbStrategy {
     api: Arc<PolymarketApi>,
     config: Config,
     discovery: MarketDiscovery,
-    states: Arc<Mutex<HashMap<String, PreLimitOrderState>>>,
-    last_status_display: Arc<Mutex<std::time::Instant>>,
-    total_profit: Arc<Mutex<f64>>,
-    trades: Arc<Mutex<HashMap<String, CycleTrade>>>,
-    closure_checked: Arc<Mutex<HashMap<String, bool>>>,
-    period_profit: Arc<Mutex<f64>>,
 }
 
-#[derive(Debug, Clone)]
-struct CycleTrade {
-    condition_id: String,
-    period_timestamp: u64,
-    market_duration_secs: u64,
-    up_token_id: Option<String>,
-    down_token_id: Option<String>,
-    up_shares: f64,
-    down_shares: f64,
-    up_avg_price: f64,
-    down_avg_price: f64,
-}
-
-impl PreLimitStrategy {
+impl ArbStrategy {
     pub fn new(api: Arc<PolymarketApi>, config: Config) -> Self {
         let discovery = MarketDiscovery::new(api.clone());
         Self {
             api,
             config,
             discovery,
-            states: Arc::new(Mutex::new(HashMap::new())),
-            last_status_display: Arc::new(Mutex::new(std::time::Instant::now())),
-            total_profit: Arc::new(Mutex::new(0.0)),
-            trades: Arc::new(Mutex::new(HashMap::new())),
-            closure_checked: Arc::new(Mutex::new(HashMap::new())),
-            period_profit: Arc::new(Mutex::new(0.0)),
         }
     }
 
-    pub async fn get_total_profit(&self) -> f64 {
-        *self.total_profit.lock().await
-    }
+    /// Wait until we're in the arbitrage window: last 5 min of 15m and same price-to-beat (from API).
+    /// Price-to-beat is not available at market start: we wait delay_secs (e.g. 30s) then poll every poll_interval_secs (e.g. 10s).
+    /// Returns (15m condition_id, 5m condition_id, tokens, 15m period_start).
+    async fn wait_for_arb_window(&self) -> Result<(String, String, ArbTokens, i64)> {
+        let delay_secs = self.config.strategy.price_to_beat_delay_secs as i64;
+        let poll_interval = self.config.strategy.price_to_beat_poll_interval_secs;
 
-    pub async fn get_period_profit(&self) -> f64 {
-        *self.period_profit.lock().await
-    }
-
-    pub async fn run(&self) -> Result<()> {
-        self.display_market_status().await?;
-        
         loop {
-            let should_display = {
-                let mut last = self.last_status_display.lock().await;
-                if last.elapsed().as_secs() >= 10 {
-                    *last = std::time::Instant::now();
-                    true
-                } else {
-                    false
-                }
-            };
-            
-            if should_display {
-                if let Err(e) = self.display_market_status().await {
-                    log::error!("Error displaying market status: {}", e);
-                }
-            }
-            
-            if let Err(e) = self.process_markets().await {
-                log::error!("Error processing markets: {}", e);
-            }
-            sleep(Duration::from_millis(self.config.strategy.check_interval_ms)).await;
-        }
-    }
+            let now = Utc::now().timestamp();
+            let period_15 = current_15m_period_start();
+            let period_5 = current_5m_period_start();
 
-    async fn process_markets(&self) -> Result<()> {
-        let assets = vec!["BTC", "ETH", "SOL", "XRP"];
-        let current_period_et = Self::get_current_1h_period_et();
-        
-        for asset in assets {
-            self.process_asset(asset, current_period_et).await?;
-        }
-        Ok(())
-    }
-    
-    /// Calculate the current running 1-hour period timestamp in ET timezone
-    fn get_current_1h_period_et() -> i64 {
-        MarketDiscovery::current_1h_period_start_et()
-    }
-    
-    fn get_current_time_et() -> i64 {
-        let now_utc = Utc::now();
-        let now_et = now_utc.with_timezone(&New_York);
-        now_et.timestamp()
-    }
-
-    async fn process_asset(&self, asset: &str, current_period_et: i64) -> Result<()> {
-        let mut states = self.states.lock().await;
-        let state = states.get(asset).cloned();
-        
-        let current_time_et = Self::get_current_time_et();
-        let next_period_start = current_period_et + 3600;
-        let time_until_next = next_period_start - current_time_et;
-
-        let needs_danger_handling = state.as_ref().map_or(false, |s| {
-            !s.merged && !s.risk_sold &&
-            ((s.up_matched && !s.down_matched) || (s.down_matched && !s.up_matched))
-        });
-
-        if time_until_next <= (self.config.strategy.place_order_before_mins * 60) as i64 {
-            let is_next_market_prepared = state.as_ref().map_or(false, |s| s.expiry == next_period_start + 3600);
-            
-            if !is_next_market_prepared && !needs_danger_handling {
-                // Signal check: evaluate current market before placing pre-orders for next
-                let signal = self.get_place_signal(asset, current_period_et).await;
-                if signal != MarketSignal::Good {
-                    if signal == MarketSignal::Bad {
-                        log::info!("{} | Bad signal for current market — skipping pre-orders for next hour", asset);
-                    }
-                } else if let Some(next_market) = self.discover_next_market(asset, next_period_start).await? {
-                    log::info!("Preparing orders for next {} market (starts in {}s)", asset, time_until_next);
-                    let (up_token_id, down_token_id) = self.discovery.get_market_tokens(&next_market.condition_id).await?;
-
-                    let price_limit = self.config.strategy.price_limit;
-                    let up_order = self.place_limit_order(&up_token_id, "BUY", price_limit).await?;
-                    let down_order = self.place_limit_order(&down_token_id, "BUY", price_limit).await?;
-                    
-                    let new_state = PreLimitOrderState {
-                        asset: asset.to_string(),
-                        condition_id: next_market.condition_id,
-                        up_token_id: up_token_id.clone(),
-                        down_token_id: down_token_id.clone(),
-                        up_order_id: up_order.order_id,
-                        down_order_id: down_order.order_id,
-                        up_order_price: price_limit,
-                        down_order_price: price_limit,
-                        up_matched: false,
-                        down_matched: false,
-                        merged: false,
-                        expiry: next_period_start + 3600,
-                        risk_sold: false,
-                        order_placed_at: current_time_et,
-                        market_period_start: next_period_start,
-                    };
-                    states.insert(asset.to_string(), new_state);
-                    
-                    return Ok(());
-                } else {
-                    log::debug!("Could not find next {} market - slug may be incorrect or market not yet available", asset);
-                }
-            }
-        }
-
-        if let Some(mut s) = state {
-            self.check_order_matches(&mut s).await?;
-
-            if s.up_matched && s.down_matched && !s.merged {
-                let threshold = self.config.strategy.sell_opposite_above;
-                let (up_price, down_price) = (
-                    self.api.get_price(&s.up_token_id, "SELL").await.ok()
-                        .and_then(|p| p.to_string().parse::<f64>().ok()).unwrap_or(0.0),
-                    self.api.get_price(&s.down_token_id, "SELL").await.ok()
-                        .and_then(|p| p.to_string().parse::<f64>().ok()).unwrap_or(0.0),
+            if !is_last_5min_of_15m(now, period_15) {
+                let next_window = period_15 + 10 * 60;
+                info!(
+                    "Not in arb window (need last 5m of 15m). Next window in {}s. Sleeping 30s.",
+                    next_window - now
                 );
-
-                let sell_opposite = if up_price >= threshold {
-                    Some(("Up", "Down", &s.down_token_id, s.down_order_price))
-                } else if down_price >= threshold {
-                    Some(("Down", "Up", &s.up_token_id, s.up_order_price))
-                } else {
-                    None
-                };
-
-                if let Some((winner, loser, token_to_sell, purchase_price)) = sell_opposite {
-                    log::info!("{}: Both matched but {} price ${:.2} >= {:.2} — selling {} to reduce loss", 
-                        asset, winner, if winner == "Up" { up_price } else { down_price }, threshold, loser);
-                    let sell_price_result = self.api.get_price(token_to_sell, "SELL").await;
-                    let sell_price = sell_price_result.ok()
-                        .and_then(|p| p.to_string().parse::<f64>().ok()).unwrap_or(0.0);
-                    if self.config.strategy.simulation_mode {
-                        let loss = (purchase_price - sell_price) * self.config.strategy.shares;
-                        let mut total = self.total_profit.lock().await;
-                        *total -= loss;
-                        let current_total = *total;
-                        drop(total);
-                        log::info!("🎮 SIMULATION: Would sell {} {} shares at ${:.4} (purchased at ${:.2})", 
-                            self.config.strategy.shares, loser, sell_price, purchase_price);
-                        log::info!("   Holding {} to expiry (pays $1). Loss on {}: ${:.2} | Total Profit: ${:.2}", 
-                            winner, loser, loss, current_total);
-                    } else {
-                        if let Err(e) = self.api.place_market_order(&token_to_sell, self.config.strategy.shares, "SELL", None).await {
-                            log::error!("Failed to sell {} token for {}: {}", loser, asset, e);
-                        } else {
-                            let loss = (purchase_price - sell_price) * self.config.strategy.shares;
-                            let mut total = self.total_profit.lock().await;
-                            *total -= loss;
-                            let current_total = *total;
-                            drop(total);
-                            log::info!("   Sold {} {} shares at ${:.2}. Holding {} to expiry (pays $1). Loss: ${:.2} | Total Profit: ${:.2}", 
-                                self.config.strategy.shares, loser, sell_price, winner, loss, current_total);
-                        }
-                    }
-                    s.merged = true;
-                } else {
-                    let profit_per_market = self.config.strategy.shares * 0.10;
-                    log::info!("Both orders matched for {}. Merging positions...", asset);
-                    if self.config.strategy.simulation_mode {
-                        log::info!("🎮 SIMULATION: Would merge {} shares for condition {}", 
-                            self.config.strategy.shares, s.condition_id);
-                        let mut total = self.total_profit.lock().await;
-                        *total += profit_per_market;
-                        let current_total = *total;
-                        drop(total);
-                        log::info!("   💰 SIMULATION: Profit locked in: ${:.2} ({} shares × $0.10) | Total Profit: ${:.2}", 
-                            profit_per_market, self.config.strategy.shares, current_total);
-                        s.merged = true;
-                    } else {
-                        log::info!("   Both matched for {}. TODO: Add redemption logic here.", asset);
-                        let mut total = self.total_profit.lock().await;
-                        *total += profit_per_market;
-                        let current_total = *total;
-                        drop(total);
-                        log::info!("   💰 Profit locked in: ${:.2} ({} shares × $0.10) | Total Profit: ${:.2}", 
-                            profit_per_market, self.config.strategy.shares, current_total);
-                        s.merged = true;
-                    }
-                }
-            }
-
-            let current_time_et = Self::get_current_time_et();
-            let time_since_market_start = current_time_et - s.market_period_start;
-            let sell_after_seconds = (self.config.strategy.sell_unmatched_after_mins * 60) as i64;
-
-            // Check danger signal: if matched token price collapsed, sell early
-            let should_sell_early = if s.up_matched && !s.down_matched {
-                self.api.get_price(&s.up_token_id, "SELL").await
-                    .ok()
-                    .and_then(|p| p.to_string().parse::<f64>().ok())
-                    .map(|p| signals::is_danger_signal(&self.config.strategy.signal, p))
-                    .unwrap_or(false)
-            } else if s.down_matched && !s.up_matched {
-                self.api.get_price(&s.down_token_id, "SELL").await
-                    .ok()
-                    .and_then(|p| p.to_string().parse::<f64>().ok())
-                    .map(|p| signals::is_danger_signal(&self.config.strategy.signal, p))
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-
-            let should_sell = !s.merged && !s.risk_sold && (
-                should_sell_early ||
-                time_since_market_start >= sell_after_seconds
-            );
-
-            if should_sell {
-                if s.up_matched && !s.down_matched {
-                    let reason = if should_sell_early { "Danger signal (price collapsed)" } else { "Timeout reached" };
-                    log::warn!("{}: {} — only Up token matched. Selling Up token and canceling Down order", asset, reason);
-                    
-                    let sell_price_result = self.api.get_price(&s.up_token_id, "SELL").await;
-                    let purchase_price = s.up_order_price;
-                    
-                    if self.config.strategy.simulation_mode {
-                        let sell_price = sell_price_result
-                            .ok()
-                            .and_then(|p| p.to_string().parse::<f64>().ok())
-                            .unwrap_or(0.0);
-                        
-                        let loss = (purchase_price - sell_price) * self.config.strategy.shares;
-                        
-                        let mut total = self.total_profit.lock().await;
-                        *total -= loss;
-                        let current_total = *total;
-                        drop(total);
-                        
-                        log::warn!("🎮 SIMULATION: Would sell {} Up token shares at ${:.4} (purchased at ${:.2})", 
-                            self.config.strategy.shares, sell_price, purchase_price);
-                        if let Some(down_order_id) = &s.down_order_id {
-                            log::warn!("🎮 SIMULATION: Would cancel Down order {}", down_order_id);
-                        }
-                        log::warn!("   💸 SIMULATION: Loss: ${:.2} | Total Profit: ${:.2}", loss, current_total);
-                    } else {
-                        let sell_price = sell_price_result
-                            .ok()
-                            .and_then(|p| p.to_string().parse::<f64>().ok())
-                            .unwrap_or(0.0);
-                        
-                        // Sell the Up token
-                        if let Err(e) = self.api.place_market_order(&s.up_token_id, self.config.strategy.shares, "SELL", None).await {
-                            log::error!("Failed to sell Up token for {}: {}", asset, e);
-                        } else {
-                            if let Some(down_order_id) = &s.down_order_id {
-                                if let Err(e) = self.api.cancel_order(down_order_id).await {
-                                    log::error!("Failed to cancel Down order for {}: {}", asset, e);
-                                } else {
-                                    log::info!("✅ Canceled Down order {} for {}", down_order_id, asset);
-                                }
-                            }
-                            
-                            let loss = (purchase_price - sell_price) * self.config.strategy.shares;
-                            
-                            let mut total = self.total_profit.lock().await;
-                            *total -= loss;
-                            let current_total = *total;
-                            drop(total);
-                            
-                            log::warn!("   💸 Sold {} Up token shares at ${:.2} (purchased at ${:.2})", 
-                                self.config.strategy.shares, sell_price, purchase_price);
-                            log::warn!("   💸 Loss: ${:.2} | Total Profit: ${:.2}", loss, current_total);
-                        }
-                    }
-                    s.risk_sold = true;
-                    s.merged = true;
-                } else if s.down_matched && !s.up_matched {
-                    let reason = if should_sell_early { "Danger signal (price collapsed)" } else { "Timeout reached" };
-                    log::warn!("{}: {} — only Down token matched. Selling Down token and canceling Up order", asset, reason);
-                    
-                    // Get current sell price for Down token
-                    let sell_price_result = self.api.get_price(&s.down_token_id, "SELL").await;
-                    let purchase_price = s.down_order_price;
-                    
-                    if self.config.strategy.simulation_mode {
-                        let sell_price = sell_price_result
-                            .ok()
-                            .and_then(|p| p.to_string().parse::<f64>().ok())
-                            .unwrap_or(0.0);
-                        
-                        let loss = (purchase_price - sell_price) * self.config.strategy.shares;
-                        
-                        let mut total = self.total_profit.lock().await;
-                        *total -= loss;
-                        let current_total = *total;
-                        drop(total);
-                        
-                        log::warn!("🎮 SIMULATION: Would sell {} Down token shares at ${:.4} (purchased at ${:.2})", 
-                            self.config.strategy.shares, sell_price, purchase_price);
-                        if let Some(up_order_id) = &s.up_order_id {
-                            log::warn!("🎮 SIMULATION: Would cancel Up order {}", up_order_id);
-                        }
-                        log::warn!("   💸 SIMULATION: Loss: ${:.2} | Total Profit: ${:.2}", loss, current_total);
-                    } else {
-                        let sell_price = sell_price_result
-                            .ok()
-                            .and_then(|p| p.to_string().parse::<f64>().ok())
-                            .unwrap_or(0.0);
-                        
-                        if let Err(e) = self.api.place_market_order(&s.down_token_id, self.config.strategy.shares, "SELL", None).await {
-                            log::error!("Failed to sell Down token for {}: {}", asset, e);
-                        } else {
-                            if let Some(up_order_id) = &s.up_order_id {
-                                if let Err(e) = self.api.cancel_order(up_order_id).await {
-                                    log::error!("Failed to cancel Up order for {}: {}", asset, e);
-                                } else {
-                                    log::info!("✅ Canceled Up order {} for {}", up_order_id, asset);
-                                }
-                            }
-                            
-                            let loss = (purchase_price - sell_price) * self.config.strategy.shares;
-                            
-                            let mut total = self.total_profit.lock().await;
-                            *total -= loss;
-                            let current_total = *total;
-                            drop(total);
-                            
-                            log::warn!("   💸 Sold {} Down token shares at ${:.2} (purchased at ${:.2})", 
-                                self.config.strategy.shares, sell_price, purchase_price);
-                            log::warn!("   💸 Loss: ${:.2} | Total Profit: ${:.2}", loss, current_total);
-                        }
-                    }
-                    s.risk_sold = true;
-                    s.merged = true;
-                }
-            }
-
-            let current_time_et = Self::get_current_time_et();
-            if current_time_et > s.expiry {
-                log::info!("Market expired for {}. Clearing state.", asset);
-                states.remove(asset);
-            } else {
-                states.insert(asset.to_string(), s);
-            }
-        } else if time_until_next > (self.config.strategy.place_order_before_mins * 60) as i64
-            && self.config.strategy.signal.mid_market_enabled
-        {
-            let signal = self.get_place_signal(asset, current_period_et).await;
-            if signal == MarketSignal::Good {
-                if let Some(current_market) = self.discover_next_market(asset, current_period_et).await? {
-                    let Some((up_price, down_price, _)) = self.get_market_snapshot(asset, current_period_et).await else {
-                        return Ok(());
-                    };
-                    let (up_order_price, down_order_price) = if up_price <= down_price {
-                        (Self::round_price(up_price), Self::round_price(0.98 - up_price))
-                    } else {
-                        (Self::round_price(0.98 - down_price), Self::round_price(down_price))
-                    };
-                    log::info!("{} | Good signal — placing mid-market orders: Up @ ${:.2}, Down @ ${:.2} (current Up ${:.2}, Down ${:.2})", 
-                        asset, up_order_price, down_order_price, up_price, down_price);
-                    let (up_token_id, down_token_id) = self.discovery.get_market_tokens(&current_market.condition_id).await?;
-                    let up_order = self.place_limit_order(&up_token_id, "BUY", up_order_price).await?;
-                    let down_order = self.place_limit_order(&down_token_id, "BUY", down_order_price).await?;
-                    let new_state = PreLimitOrderState {
-                        asset: asset.to_string(),
-                        condition_id: current_market.condition_id,
-                        up_token_id: up_token_id.clone(),
-                        down_token_id: down_token_id.clone(),
-                        up_order_id: up_order.order_id,
-                        down_order_id: down_order.order_id,
-                        up_order_price,
-                        down_order_price,
-                        up_matched: false,
-                        down_matched: false,
-                        merged: false,
-                        expiry: current_period_et + 3600,
-                        risk_sold: false,
-                        order_placed_at: current_time_et,
-                        market_period_start: current_period_et,
-                    };
-                    states.insert(asset.to_string(), new_state);
-                    return Ok(());
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn get_market_snapshot(&self, asset: &str, period_start: i64) -> Option<(f64, f64, i64)> {
-        let asset_slug = ASSET_TO_SLUG
-            .iter()
-            .find(|(name, _)| *name == asset)
-            .map(|(_, slug)| *slug)
-            .unwrap_or("bitcoin");
-        let slug = MarketDiscovery::build_1h_slug(asset_slug, period_start);
-        let market = self.api.get_market_by_slug(&slug).await.ok()?;
-        if !market.active || market.closed {
-            return None;
-        }
-        let (up_token_id, down_token_id) = self.discovery.get_market_tokens(&market.condition_id).await.ok()?;
-        let (up_res, down_res) = tokio::join!(
-            self.api.get_price(&up_token_id, "SELL"),
-            self.api.get_price(&down_token_id, "SELL")
-        );
-        let up_price = up_res.ok()?.to_string().parse::<f64>().ok()?;
-        let down_price = down_res.ok()?.to_string().parse::<f64>().ok()?;
-        let current_time_et = Self::get_current_time_et();
-        let market_end = period_start + 3600;
-        let time_remaining = market_end - current_time_et;
-        Some((up_price, down_price, time_remaining.max(0)))
-    }
-
-    async fn get_place_signal(&self, asset: &str, period_start: i64) -> MarketSignal {
-        let Some((up_price, down_price, time_remaining)) = self.get_market_snapshot(asset, period_start).await else {
-            return MarketSignal::Unknown;
-        };
-        signals::evaluate_place_signal(
-            &self.config.strategy.signal,
-            up_price,
-            down_price,
-            time_remaining,
-        )
-    }
-
-    async fn discover_next_market(&self, asset_name: &str, next_timestamp: i64) -> Result<Option<Market>> {
-        let asset_slug = ASSET_TO_SLUG
-            .iter()
-            .find(|(name, _)| *name == asset_name)
-            .map(|(_, slug)| *slug)
-            .unwrap_or("bitcoin");
-        
-        let slug = MarketDiscovery::build_1h_slug(asset_slug, next_timestamp);
-        match self.api.get_market_by_slug(&slug).await {
-            Ok(m) => {
-                if m.active && !m.closed {
-                    Ok(Some(m))
-                } else {
-                    Ok(None)
-                }
-            }
-            Err(e) => {
-                log::debug!("Failed to find market with slug {}: {}", slug, e);
-                Ok(None)
-            }
-        }
-    }
-
-    pub async fn check_market_closure(&self) -> Result<()> {
-        let trades: Vec<(String, CycleTrade)> = {
-            let t = self.trades.lock().await;
-            t.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        };
-        if trades.is_empty() {
-            return Ok(());
-        }
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        for (market_key, trade) in trades {
-            let market_end = trade.period_timestamp + trade.market_duration_secs;
-            if current_time < market_end {
+                sleep(Duration::from_secs(30)).await;
                 continue;
             }
 
-            let checked = self.closure_checked.lock().await;
-            if checked.get(&trade.condition_id).copied().unwrap_or(false) {
-                drop(checked);
-                continue;
-            }
-            drop(checked);
-
-            let market = match self.api.get_market(&trade.condition_id).await {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("Failed to fetch market {}: {}", &trade.condition_id[..16], e);
+            let (m15, _) = match self.discovery.get_15m_market(period_15).await? {
+                Some((cid, _)) => (cid, ()),
+                None => {
+                    warn!("15m market not found for period {}. Sleeping 10s.", period_15);
+                    sleep(Duration::from_secs(10)).await;
                     continue;
                 }
             };
-            if !market.closed {
+            let (m5, _) = match self.discovery.get_5m_market(period_5).await? {
+                Some((cid, _)) => (cid, ()),
+                None => {
+                    warn!("5m market not found for period {}. Sleeping 10s.", period_5);
+                    sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+            };
+
+            // Price-to-beat API is not available until delay_secs after market start (15m ~2min, 5m ~30s; we use 30s for both).
+            let ready_at_15 = period_15 + delay_secs;
+            let ready_at_5 = period_5 + delay_secs;
+            if now < ready_at_15 || now < ready_at_5 {
+                let wait = (ready_at_15.max(ready_at_5) - now).max(1) as u64;
+                info!(
+                    "Waiting {}s for price-to-beat API (available {}s after market start).",
+                    wait, delay_secs
+                );
+                sleep(Duration::from_secs(wait)).await;
                 continue;
             }
 
-            let up_wins = trade
-                .up_token_id
-                .as_ref()
-                .map(|id| market.tokens.iter().any(|t| t.token_id == *id && t.winner))
-                .unwrap_or(false);
-            let down_wins = trade
-                .down_token_id
-                .as_ref()
-                .map(|id| market.tokens.iter().any(|t| t.token_id == *id && t.winner))
-                .unwrap_or(false);
+            // Fetch price-to-beat for both markets. Use ISO times so they match slug btc-updown-15m-{period_15} / btc-updown-5m-{period_5}.
+            let event_start_15m_iso = format_timestamp_iso(period_15);
+            let end_date_15m_iso = format_timestamp_iso(period_15 + MARKET_15M_DURATION_SECS);
+            let event_start_5m_iso = format_timestamp_iso(period_5);
+            let end_date_5m_iso = format_timestamp_iso(period_5 + MARKET_5M_DURATION_SECS);
 
-            let total_cost = (trade.up_shares * trade.up_avg_price) + (trade.down_shares * trade.down_avg_price);
-            let payout = if up_wins {
-                trade.up_shares * 1.0
-            } else if down_wins {
-                trade.down_shares * 1.0
-            } else {
-                0.0
+            let m15_beat = self
+                .api
+                .get_crypto_price_to_beat("BTC", &event_start_15m_iso, "fifteen", &end_date_15m_iso)
+                .await?;
+            let m5_beat = self
+                .api
+                .get_crypto_price_to_beat("BTC", &event_start_5m_iso, "five", &end_date_5m_iso)
+                .await?;
+
+            let same_beat = match (m15_beat, m5_beat) {
+                (Some(a), Some(b)) => (a - b).abs() < 0.01,
+                _ => false,
             };
-            let pnl = payout - total_cost;
 
-            let winner = if up_wins { "Up" } else if down_wins { "Down" } else { "Unknown" };
-            eprintln!("=== Market resolved ===");
-            eprintln!(
-                "Market closed | condition {} | Winner: {} | Up {:.2} @ {:.4} | Down {:.2} @ {:.4} | Cost ${:.2} | Payout ${:.2} | Actual PnL ${:.2}",
-                &trade.condition_id[..16],
-                winner,
-                trade.up_shares,
-                trade.up_avg_price,
-                trade.down_shares,
-                trade.down_avg_price,
-                total_cost,
-                payout,
-                pnl
+            if !same_beat {
+                info!(
+                    "Price-to-beat mismatch: 15m={:?} 5m={:?}. Polling again in {}s.",
+                    m15_beat, m5_beat, poll_interval
+                );
+                sleep(Duration::from_secs(poll_interval)).await;
+                continue;
+            }
+
+            info!(
+                "Arb window active: 15m period {} (last 5m), 5m period {}, price-to-beat {:?}",
+                period_15, period_5, m15_beat
             );
 
-            if !self.config.strategy.simulation_mode && (up_wins || down_wins) {
-                let (token_id, outcome) = if up_wins && trade.up_shares > 0.001 {
-                    (trade.up_token_id.as_deref().unwrap_or(""), "Up")
-                } else {
-                    (trade.down_token_id.as_deref().unwrap_or(""), "Down")
-                };
-                let _units = if up_wins { trade.up_shares } else { trade.down_shares };
-                if let Err(e) = self
-                    .api
-                    .redeem_tokens(&trade.condition_id, token_id, outcome)
-                    .await
-                {
-                    warn!("Redeem failed: {}", e);
-                }
-            }
+            let (m15_up, m15_down) = self.discovery.get_market_tokens(&m15).await?;
+            let (m5_up, m5_down) = self.discovery.get_market_tokens(&m5).await?;
 
-            {
-                let mut total = self.total_profit.lock().await;
-                *total += pnl;
-            }
-            {
-                let mut period = self.period_profit.lock().await;
-                *period += pnl;
-            }
-            let total_actual_pnl = *self.total_profit.lock().await;
-            eprintln!(
-                "  -> Actual PnL this market: ${:.2} | Total actual PnL (all time): ${:.2}",
-                pnl,
-                total_actual_pnl
-            );
-            {
-                let mut c = self.closure_checked.lock().await;
-                c.insert(trade.condition_id.clone(), true);
-            }
-            let mut t = self.trades.lock().await;
-            t.remove(&market_key);
+            return Ok((
+                m15,
+                m5,
+                ArbTokens {
+                    m15_up,
+                    m15_down,
+                    m5_up,
+                    m5_down,
+                },
+                period_15,
+            ));
         }
-        Ok(())
     }
 
     fn round_price(price: f64) -> f64 {
@@ -619,260 +291,189 @@ impl PreLimitStrategy {
         rounded.clamp(0.01, 0.99)
     }
 
-    async fn place_limit_order(&self, token_id: &str, side: &str, price: f64) -> Result<OrderResponse> {
+    async fn place_limit_buy(&self, token_id: &str, price: f64) -> Result<OrderResponse> {
         let price = Self::round_price(price);
+        let shares = self.config.strategy.shares;
         if self.config.strategy.simulation_mode {
-            log::info!("🎮 SIMULATION: Would place {} order for token {}: {} shares @ ${:.2}", 
-                side, token_id, self.config.strategy.shares, price);
-            
-            let fake_order_id = format!("SIM-{}-{}", side, chrono::Utc::now().timestamp());
-            
-            Ok(OrderResponse {
-                order_id: Some(fake_order_id),
+            info!(
+                "🎮 SIMULATION: Would place BUY {} shares @ ${:.4} for token {}",
+                shares, price, &token_id[..token_id.len().min(12)]
+            );
+            return Ok(OrderResponse {
+                order_id: Some(format!("SIM-{}", Utc::now().timestamp())),
                 status: "SIMULATED".to_string(),
-                message: Some("Order simulated (not placed)".to_string()),
-            })
-        } else {
-            let order = OrderRequest {
-                token_id: token_id.to_string(),
-                side: side.to_string(),
-                size: self.config.strategy.shares.to_string(),
-                price: price.to_string(),
-                order_type: "LIMIT".to_string(),
-            };
-            self.api.place_order(&order).await
+                message: Some("Simulated".to_string()),
+            });
         }
-    }
-
-    async fn check_order_matches(&self, state: &mut PreLimitOrderState) -> Result<()> {
-        let current_time_et = Self::get_current_time_et();
-        
-        // IMPORTANT: Only check matches if the market where orders were placed has actually started
-        // Market starts at market_period_start. Orders can't match before the market is active.
-        // This check applies to BOTH simulation and production modes.
-        if current_time_et < state.market_period_start {
-            // Market hasn't started yet, can't match orders - return early
-            log::debug!("Market {} for {} hasn't started yet (current: {}, start: {})", 
-                state.market_period_start, state.asset, current_time_et, state.market_period_start);
-            return Ok(());
-        }
-
-        let up_price_result = self.api.get_price(&state.up_token_id, "SELL").await;
-        
-        // Get Down token price via REST API
-        let down_price_result = self.api.get_price(&state.down_token_id, "SELL").await;
-        
-        if let Ok(up_price) = up_price_result {
-            let up_price_f64: f64 = up_price.to_string().parse().unwrap_or(0.0);
-            let limit = state.up_order_price;
-            if (up_price_f64 <= limit || (up_price_f64 - limit).abs() < 0.001) && !state.up_matched {
-                if self.config.strategy.simulation_mode {
-                    log::info!("🎮 SIMULATION: Up order matched for {} (price hit ${:.4} <= ${:.2})", 
-                        state.asset, up_price_f64, limit);
-                } else {
-                    log::info!("✅ Up order matched for {} (price hit ${:.4} <= ${:.2})", 
-                        state.asset, up_price_f64, limit);
-                }
-                state.up_matched = true;
-            }
-        }
-        
-        if let Ok(down_price) = down_price_result {
-            let down_price_f64: f64 = down_price.to_string().parse().unwrap_or(0.0);
-            let limit = state.down_order_price;
-            let price_matches = down_price_f64 <= limit || (down_price_f64 - limit).abs() < 0.001;
-            
-            log::debug!("Checking Down order for {}: price=${:.2}, limit=${:.2}, matches={}, already_matched={}", 
-                state.asset, down_price_f64, limit, price_matches, state.down_matched);
-            
-            if price_matches && !state.down_matched {
-                if self.config.strategy.simulation_mode {
-                    log::info!("🎮 SIMULATION: Down order matched for {} (price hit ${:.2} <= ${:.2})", 
-                        state.asset, down_price_f64, limit);
-                } else {
-                    log::info!("✅ Down order matched for {} (price hit ${:.2} <= ${:.2})", 
-                        state.asset, down_price_f64, limit);
-                }
-                state.down_matched = true;
-            }
-        } else {
-            log::debug!("Failed to get Down price for {}: {:?}", state.asset, down_price_result);
-        }
-        Ok(())
-    }
-
-    async fn display_market_status(&self) -> Result<()> {
-        let assets = vec!["BTC", "ETH", "SOL", "XRP"];
-        let current_time_et = Self::get_current_time_et();
-        
-        let total_profit = {
-            let total = self.total_profit.lock().await;
-            *total
+        let order = OrderRequest {
+            token_id: token_id.to_string(),
+            side: "BUY".to_string(),
+            size: shares.to_string(),
+            price: price.to_string(),
+            order_type: "LIMIT".to_string(),
         };
-        
-        log::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        log::info!("📊 Market Status Update | 💰 Total Profit: ${:.2}", total_profit);
-        log::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        
-        let mut states = self.states.lock().await;
-        let mut states_to_check: Vec<String> = Vec::new();
-        
-        for asset in &assets {
-            let asset_slug = ASSET_TO_SLUG
-                .iter()
-                .find(|(name, _)| *name == *asset)
-                .map(|(_, slug)| *slug)
-                .unwrap_or("bitcoin");
-            
-            if let Some(state) = states.get_mut(*asset) {
-                let market_period = state.market_period_start;
-                let slug = MarketDiscovery::build_1h_slug(asset_slug, market_period);
-                
-                match self.api.get_market_by_slug(&slug).await {
-                    Ok(market) => {
-                        if market.active && !market.closed {
-                            let up_price_result = self.api.get_price(&state.up_token_id, "SELL").await;
-                            let down_price_result = self.api.get_price(&state.down_token_id, "SELL").await;
-                            
-                            // Calculate remaining time for the market where orders were placed (1h = 3600s)
-                            let market_end = market_period + 3600;
-                            let time_remaining = market_end - current_time_et;
-                            let minutes = if time_remaining > 0 { time_remaining / 60 } else { 0 };
-                            let seconds = if time_remaining > 0 { time_remaining % 60 } else { 0 };
+        self.api.place_order(&order).await
+    }
 
-                            let up_price_str = match up_price_result {
-                                Ok(p) => format!("${:.2}", p),
-                                Err(_) => "N/A".to_string(),
-                            };
-                            let down_price_str = match down_price_result {
-                                Ok(p) => format!("${:.2}", p),
-                                Err(_) => "N/A".to_string(),
-                            };
-                            
-                            // Orders status: Only show checkmark based on state (once matched, stays matched)
-                            // Also check current prices to trigger state update if needed
-                            let up_limit = state.up_order_price;
-                            let down_limit = state.down_order_price;
-                            let up_price_matched = up_price_result.as_ref()
-                                .ok()
-                                .and_then(|p| p.to_string().parse::<f64>().ok())
-                                .map(|p| p <= up_limit || (p - up_limit).abs() < 0.001)
-                                .unwrap_or(false);
-                            let down_price_matched = down_price_result.as_ref()
-                                .ok()
-                                .and_then(|p| p.to_string().parse::<f64>().ok())
-                                .map(|p| p <= down_limit || (p - down_limit).abs() < 0.001)
-                                .unwrap_or(false);
-
-                            if up_price_matched && !state.up_matched {
-                                state.up_matched = true;
-                                states_to_check.push(asset.to_string());
-                                log::debug!("Display: Up order matched for {} (price hit limit)", asset);
-                            }
-                            if down_price_matched && !state.down_matched {
-                                state.down_matched = true;
-                                states_to_check.push(asset.to_string());
-                                log::debug!("Display: Down order matched for {} (price hit limit)", asset);
-                            }
-                            
-                            // Display: Only use state flags (once matched, always show ✓)
-                            // Don't check current prices for display - state persists the match status
-                            let order_status = format!("Up:{} Down:{}", 
-                                if state.up_matched { "✓" } else { "⏳" },
-                                if state.down_matched { "✓" } else { "⏳" });
-                            
-                            log::info!("{} | Up: {} | Down: {} | Time: {}m {}s | Orders: {} | Market: {}", 
-                                asset, up_price_str, down_price_str, minutes, seconds, order_status, market_period);
-                        } else {
-                            log::info!("{} | Market {} inactive/closed | Orders: Up:{} Down:{}", 
-                                asset, market_period,
-                                if state.up_matched { "✓" } else { "⏳" },
-                                if state.down_matched { "✓" } else { "⏳" });
-                        }
-                    }
-                    Err(_) => {
-                        log::info!("{} | Market {} not found | Orders: Up:{} Down:{}", 
-                            asset, market_period,
-                            if state.up_matched { "✓" } else { "⏳" },
-                            if state.down_matched { "✓" } else { "⏳" });
-                    }
-                }
-            } else {
-                let current_period_et = Self::get_current_1h_period_et();
-                let slug = MarketDiscovery::build_1h_slug(asset_slug, current_period_et);
-                log::debug!("Trying to find {} market with slug: {}", asset, slug);
-                
-                match self.api.get_market_by_slug(&slug).await {
-                    Ok(market) => {
-                        if market.active && !market.closed {
-                            match self.api.get_market(&market.condition_id).await {
-                                Ok(_) => {
-                                    match self.discovery.get_market_tokens(&market.condition_id).await {
-                                        Ok((up_token_id, down_token_id)) => {
-                                            // Get prices via REST API
-                                            let (up_price_result, down_price_result) = tokio::join!(
-                                                self.api.get_price(&up_token_id, "SELL"),
-                                                self.api.get_price(&down_token_id, "SELL")
-                                            );
-                                            
-                                            let market_end = current_period_et + 3600;
-                                            let time_remaining = market_end - current_time_et;
-                                            let minutes = if time_remaining > 0 { time_remaining / 60 } else { 0 };
-                                            let seconds = if time_remaining > 0 { time_remaining % 60 } else { 0 };
-
-                                            let up_price_str = match up_price_result {
-                                                Ok(p) => format!("${:.2}", p),
-                                                Err(_) => "N/A".to_string(),
-                                            };
-                                            let down_price_str = match down_price_result {
-                                                Ok(p) => format!("${:.2}", p),
-                                                Err(_) => "N/A".to_string(),
-                                            };
-                                            
-                                            log::info!("{} | Up: {} | Down: {} | Time: {}m {}s | Orders: No orders | Market: {}", 
-                                                asset, up_price_str, down_price_str, minutes, seconds, current_period_et);
-                                        }
-                                        Err(_) => {
-                                            log::info!("{} | Current market found but failed to get tokens", asset);
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    log::info!("{} | Current market found but failed to get details", asset);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::info!("{} | Current market not found (slug: {}, error: {})", asset, slug, e);
-                    }
-                }
+    /// One arb round: run WebSocket until market ends; when sum < threshold place orders, wait 10s, verify, repeat.
+    async fn run_arb_round(
+        &self,
+        tokens: &ArbTokens,
+        period_15_start: i64,
+    ) -> Result<()> {
+        let prices: PricesSnapshot = Arc::new(RwLock::new(Default::default()));
+        let asset_ids = vec![
+            tokens.m15_up.clone(),
+            tokens.m15_down.clone(),
+            tokens.m5_up.clone(),
+            tokens.m5_down.clone(),
+        ];
+        let ws_url = self.config.polymarket.ws_url.clone();
+        let prices_clone = Arc::clone(&prices);
+        let ws_handle = tokio::spawn(async move {
+            if let Err(e) = run_market_ws(&ws_url, asset_ids, prices_clone).await {
+                warn!("WebSocket exited: {}", e);
             }
-        }
-        
-        // States are already updated in the loop above (get_mut modifies in place)
-        drop(states);
-        log::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        });
 
-        for asset in states_to_check {
-            let mut states = self.states.lock().await;
-            if let Some(mut state) = states.get_mut(&asset) {
-                // Check and update matches based on current prices
-                // Note: get_mut gives us a mutable reference, so changes are already in the HashMap
-                let before_up = state.up_matched;
-                let before_down = state.down_matched;
-                
-                if let Err(e) = self.check_order_matches(&mut state).await {
-                    log::debug!("Error checking order matches for {}: {}", asset, e);
-                }
+        let threshold = self.config.strategy.sum_threshold;
+        let verify_secs = self.config.strategy.verify_fill_secs;
+        let mut pending_placement = false;
+        let mut last_place_time = 0i64;
 
-                if state.up_matched != before_up || state.down_matched != before_down {
-                    log::debug!("State updated for {}: up_matched={}->{}, down_matched={}->{}", 
-                        asset, before_up, state.up_matched, before_down, state.down_matched);
-                }
+        loop {
+            let now = Utc::now().timestamp();
+            if now >= period_15_start + MARKET_15M_DURATION_SECS {
+                info!("15m market ended. Exiting arb round.");
+                break;
             }
+
+            if pending_placement {
+                let elapsed = now - last_place_time;
+                if elapsed >= verify_secs as i64 {
+                    pending_placement = false;
+                    // Verification is done in the block below when we set pending_placement = true
+                }
+                sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+
+            let snap = prices.read().await;
+            let m15_up_ask = snap.get(&tokens.m15_up).and_then(|p| p.ask);
+            let m15_down_ask = snap.get(&tokens.m15_down).and_then(|p| p.ask);
+            let m5_up_ask = snap.get(&tokens.m5_up).and_then(|p| p.ask);
+            let m5_down_ask = snap.get(&tokens.m5_down).and_then(|p| p.ask);
+            drop(snap);
+
+            let (sum1, sum2) = (
+                m15_up_ask.zip(m5_down_ask).map(|(a, b)| a + b),
+                m15_down_ask.zip(m5_up_ask).map(|(a, b)| a + b),
+            );
+
+            let (do_place_1, do_place_2) = (
+                sum1.map(|s| s < threshold).unwrap_or(false),
+                sum2.map(|s| s < threshold).unwrap_or(false),
+            );
+
+            if do_place_1 {
+                let ask_a = m15_up_ask.unwrap();
+                let ask_b = m5_down_ask.unwrap();
+                info!(
+                    "Arb opportunity: 15m Up ask {:.4} + 5m Down ask {:.4} = {:.4} < {:.2} — placing both",
+                    ask_a, ask_b, ask_a + ask_b, threshold
+                );
+                let r1 = self.place_limit_buy(&tokens.m15_up, ask_a).await;
+                let r2 = self.place_limit_buy(&tokens.m5_down, ask_b).await;
+                match (&r1, &r2) {
+                    (Ok(_), Ok(_)) => {
+                        pending_placement = true;
+                        last_place_time = Utc::now().timestamp();
+                        let api = self.api.clone();
+                        let params = VerifyRiskParams {
+                            token_a: tokens.m15_up.clone(),
+                            token_b: tokens.m5_down.clone(),
+                            order_id_a: r1.as_ref().ok().and_then(|o| o.order_id.clone()),
+                            order_id_b: r2.as_ref().ok().and_then(|o| o.order_id.clone()),
+                            shares: self.config.strategy.shares,
+                            verify_secs: self.config.strategy.verify_fill_secs,
+                            simulation: self.config.strategy.simulation_mode,
+                            label_a: "15m Up".to_string(),
+                            label_b: "5m Down".to_string(),
+                        };
+                        tokio::spawn(async move {
+                            verify_and_manage_risk(api, params).await;
+                        });
+                    }
+                    _ => {
+                        error!("Place failed: {:?} / {:?}", r1, r2);
+                    }
+                }
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+
+            if do_place_2 {
+                let ask_a = m15_down_ask.unwrap();
+                let ask_b = m5_up_ask.unwrap();
+                info!(
+                    "Arb opportunity: 15m Down ask {:.4} + 5m Up ask {:.4} = {:.4} < {:.2} — placing both",
+                    ask_a, ask_b, ask_a + ask_b, threshold
+                );
+                let r1 = self.place_limit_buy(&tokens.m15_down, ask_a).await;
+                let r2 = self.place_limit_buy(&tokens.m5_up, ask_b).await;
+                match (&r1, &r2) {
+                    (Ok(_), Ok(_)) => {
+                        pending_placement = true;
+                        last_place_time = Utc::now().timestamp();
+                        let api = self.api.clone();
+                        let params = VerifyRiskParams {
+                            token_a: tokens.m15_down.clone(),
+                            token_b: tokens.m5_up.clone(),
+                            order_id_a: r1.as_ref().ok().and_then(|o| o.order_id.clone()),
+                            order_id_b: r2.as_ref().ok().and_then(|o| o.order_id.clone()),
+                            shares: self.config.strategy.shares,
+                            verify_secs: self.config.strategy.verify_fill_secs,
+                            simulation: self.config.strategy.simulation_mode,
+                            label_a: "15m Down".to_string(),
+                            label_b: "5m Up".to_string(),
+                        };
+                        tokio::spawn(async move {
+                            verify_and_manage_risk(api, params).await;
+                        });
+                    }
+                    _ => {
+                        error!("Place failed: {:?} / {:?}", r1, r2);
+                    }
+                }
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+
+            sleep(Duration::from_millis(20)).await;
         }
-        
+
+        ws_handle.abort();
         Ok(())
+    }
+
+    pub async fn run(&self) -> Result<()> {
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        info!("BTC 15m vs 5m arbitrage bot");
+        info!("   Sum threshold: {} (place when sum of asks < this)", self.config.strategy.sum_threshold);
+        info!("   Shares per side: {}", self.config.strategy.shares);
+        info!("   Verify fill after {}s", self.config.strategy.verify_fill_secs);
+        if self.config.strategy.simulation_mode {
+            info!("   🎮 SIMULATION MODE — no real orders");
+        }
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+        loop {
+            let (m15_cid, m5_cid, tokens, period_15) = self.wait_for_arb_window().await?;
+            info!("Running arb round: 15m {} … 5m {} …", &m15_cid[..20], &m5_cid[..20]);
+            if let Err(e) = self.run_arb_round(&tokens, period_15).await {
+                error!("Arb round error: {}", e);
+            }
+            sleep(Duration::from_secs(5)).await;
+        }
     }
 }

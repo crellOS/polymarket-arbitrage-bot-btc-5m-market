@@ -10,9 +10,9 @@ use log::{warn, error};
 use std::sync::Arc;
 
 // Official SDK imports for proper order signing
-use polymarket_clients_sdk::clob::{Client as ClobClient, Config as ClobConfig};
-use polymarket_clients_sdk::clob::types::{Side, OrderType, SignatureType};
-use polymarket_clients_sdk::POLYGON;
+use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
+use polymarket_client_sdk::clob::types::{Side, OrderType, SignatureType};
+use polymarket_client_sdk::POLYGON;
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer as _;
 use alloy::primitives::Address as AlloyAddress;
@@ -221,6 +221,42 @@ impl PolymarketApi {
         }
         
         anyhow::bail!("Invalid market response format: no markets array found")
+    }
+
+    /// Fetch price-to-beat (openPrice) from Polymarket crypto-price API.
+    /// Not available immediately at market start: 15m ~2 min, 5m ~30 sec. Call after delay and poll.
+    /// variant: "fifteen" for 15m market, "five" for 5m market.
+    /// event_start_iso and end_date_iso must be in ISO 8601 UTC (e.g. "2026-02-13T12:45:00Z") so the API
+    /// returns the correct open price for the market identified by slug btc-updown-{15m|5m}-{timestamp}.
+    pub async fn get_crypto_price_to_beat(
+        &self,
+        symbol: &str,
+        event_start_iso: &str,
+        variant: &str,
+        end_date_iso: &str,
+    ) -> Result<Option<f64>> {
+        const CRYPTO_PRICE_URL: &str = "https://polymarket.com/api/crypto/crypto-price";
+        let response = self
+            .client
+            .get(CRYPTO_PRICE_URL)
+            .query(&[
+                ("symbol", symbol),
+                ("eventStartTime", event_start_iso),
+                ("variant", variant),
+                ("endDate", end_date_iso),
+            ])
+            .send()
+            .await
+            .context("Failed to fetch crypto price-to-beat")?;
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        let json: Value = response.json().await.context("Parse crypto-price response")?;
+        let open_price = json
+            .get("openPrice")
+            .and_then(|v| v.as_f64())
+            .or_else(|| json.get("openPrice").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()));
+        Ok(open_price)
     }
 
     // Get order book for a specific token
@@ -697,6 +733,17 @@ impl PolymarketApi {
             .context(format!("Failed to cancel order {}", order_id))?;
         
         Ok(())
+    }
+
+    /// Fetch order status (e.g. size_matched) to verify fill. Uses data API.
+    pub async fn get_order_status(&self, order_id: &str) -> Result<OrderStatus> {
+        let url = format!("https://data-api.polymarket.com/order/{}", order_id.trim_start_matches("0x"));
+        let response = self.client.get(&url).send().await.context("Failed to fetch order status")?;
+        if !response.status().is_success() {
+            anyhow::bail!("Order status request failed: {}", response.status());
+        }
+        let status: OrderStatus = response.json().await.context("Parse order status")?;
+        Ok(status)
     }
     
     #[allow(dead_code)]

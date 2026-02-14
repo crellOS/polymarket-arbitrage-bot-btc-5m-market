@@ -65,31 +65,22 @@ pub struct OrderResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderStatus {
+    pub id: Option<String>,
+    pub status: Option<String>,
+    #[serde(rename = "original_size")]
+    pub original_size: Option<String>,
+    #[serde(rename = "size_matched")]
+    pub size_matched: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 
 pub struct RedeemResponse {
     pub success: bool,
     pub message: Option<String>,
     pub transaction_hash: Option<String>,
     pub amount_redeemed: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PreLimitOrderState {
-    pub asset: String,
-    pub condition_id: String,
-    pub up_token_id: String,
-    pub down_token_id: String,
-    pub up_order_id: Option<String>,
-    pub down_order_id: Option<String>,
-    pub up_order_price: f64,
-    pub down_order_price: f64,
-    pub up_matched: bool,
-    pub down_matched: bool,
-    pub merged: bool,
-    pub expiry: i64,
-    pub risk_sold: bool,
-    pub order_placed_at: i64,
-    pub market_period_start: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

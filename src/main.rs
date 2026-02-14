@@ -1,10 +1,9 @@
 mod api;
 mod config;
-mod models;
 mod discovery;
-mod signals;
+mod models;
 mod strategy;
-
+mod ws;
 
 use anyhow::Result;
 use clap::Parser;
@@ -12,44 +11,25 @@ use config::{Args, Config};
 use std::io::Write;
 use std::sync::Arc;
 use api::PolymarketApi;
-use strategy::PreLimitStrategy;
-use log::warn;
+use strategy::ArbStrategy;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
-        .format(|buf, record| {
-            writeln!(buf, "{}", record.args())
-        })
+        .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
 
     let args = Args::parse();
     let config = Config::load(&args.config)?;
-    let shares = config.strategy.shares;
-    let price = config.strategy.price_limit;
-    let cost_per_side = shares * price;
-    let payout_per_trade = cost_per_side * 2.0;
-    const N_ASSETS: u32 = 4;
-    let four_assets = (N_ASSETS as f64) * cost_per_side;
 
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    eprintln!("📋 Confirming configuration");
-    eprintln!("   shares per side        {:.0}", shares);
-    eprintln!("   ave price per share   ${:.2}", price);
-    eprintln!("   payout per trade      ${:.0} × 2 = ${:.0}", cost_per_side, payout_per_trade);
-    eprintln!("   {} assets              ${:.0}", N_ASSETS, four_assets);
+    eprintln!("📋 BTC 15m vs 5m arbitrage bot");
+    eprintln!("   sum_threshold     {}", config.strategy.sum_threshold);
+    eprintln!("   shares per side   {}", config.strategy.shares);
+    eprintln!("   verify_fill_secs  {}s", config.strategy.verify_fill_secs);
+    eprintln!("   simulation_mode   {}", config.strategy.simulation_mode);
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-    eprintln!("🚀 Starting Polymarket Pre-Limit Order Bot");
-    if config.strategy.simulation_mode {
-        eprintln!("🎮 SIMULATION MODE ENABLED - No real orders will be placed");
-        eprintln!("   Orders will match when prices hit ${:.2} or below", config.strategy.price_limit);
-    }
-    eprintln!("📈 Strategy: Placing Up/Down limit orders at ${:.2} for 1h markets (BTC, ETH, SOL, XRP)", config.strategy.price_limit);
-    if config.strategy.signal.enabled {
-        eprintln!("   📡 Signal-based risk management: enabled (place on good signal, skip on bad, sell early on danger)");
-    }
 
     let api = Arc::new(PolymarketApi::new(
         config.polymarket.gamma_api_url.clone(),
@@ -73,33 +53,13 @@ async fn main() -> Result<()> {
             anyhow::bail!("Authentication failed. Please check your credentials.");
         }
     } else {
-        log::warn!("⚠️ No private key provided. Bot will only be able to monitor markets.");
+        log::warn!("⚠️ No private key provided. Bot can only monitor (no orders).");
     }
 
-
-    let market_closure_interval = config.strategy.market_closure_check_interval_seconds;
-    let strategy = Arc::new(PreLimitStrategy::new(api, config));
-    let strategy_for_closure = Arc::clone(&strategy);
-
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(market_closure_interval));
-        loop {
-            interval.tick().await;
-            if let Err(e) = strategy_for_closure.check_market_closure().await {
-                warn!("Error checking market closure: {}", e);
-            }
-            let total_profit = strategy_for_closure.get_total_profit().await;
-            let period_profit = strategy_for_closure.get_period_profit().await;
-            if total_profit != 0.0 || period_profit != 0.0 {
-                eprintln!("Current Profit - Period: ${:.2} | Total: ${:.2}", period_profit, total_profit);
-            }
-        }
-    });
-
+    let strategy = ArbStrategy::new(api, config);
     strategy.run().await
 }
 
-    
 async fn run_redeem_only(
     api: &PolymarketApi,
     config: &Config,
@@ -113,7 +73,11 @@ async fn run_redeem_only(
 
     eprintln!("Redeem-only mode (proxy: {})", proxy);
     let cids: Vec<String> = if let Some(cid) = condition_id {
-        let cid = if cid.starts_with("0x") { cid.to_string() } else { format!("0x{}", cid) };
+        let cid = if cid.starts_with("0x") {
+            cid.to_string()
+        } else {
+            format!("0x{}", cid)
+        };
         eprintln!("Redeeming condition: {}", cid);
         vec![cid]
     } else {
@@ -142,7 +106,9 @@ async fn run_redeem_only(
             }
         }
     }
-    eprintln!("\nRedeem complete. Succeeded: {}, Failed: {}", ok_count, fail_count);
+    eprintln!(
+        "\nRedeem complete. Succeeded: {}, Failed: {}",
+        ok_count, fail_count
+    );
     Ok(())
 }
-
