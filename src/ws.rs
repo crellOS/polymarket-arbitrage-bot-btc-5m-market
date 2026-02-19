@@ -61,8 +61,20 @@ fn parse_f64(s: &str) -> Option<f64> {
     s.trim().parse().ok()
 }
 
+/// Treat as placeholder/no-book: bid near 0.01 and ask near 0.99 (exchange sometimes sends this when book is empty or reset).
+fn is_placeholder_quote(bid: Option<f64>, ask: Option<f64>) -> bool {
+    match (bid, ask) {
+        (Some(b), Some(a)) => b < 0.05 && a > 0.95,
+        (Some(b), None) => b < 0.05,
+        (None, Some(a)) => a > 0.95,
+        (None, None) => false,
+    }
+}
+
+const WS_RECONNECT_DELAY_SECS: u64 = 3;
+
 /// Run WebSocket market channel: connect, subscribe to asset_ids, and update shared prices.
-/// Exits when the stream closes or on unrecoverable error.
+/// Reconnects automatically on disconnect or protocol error (e.g. connection reset).
 pub async fn run_market_ws(
     ws_base_url: &str,
     asset_ids: Vec<String>,
@@ -73,44 +85,63 @@ pub async fn run_market_ws(
         ws_base_url.trim_end_matches('/'),
         WS_MARKET_PATH
     );
-    info!("Connecting to market WebSocket: {}", url);
-
-    let (ws_stream, _) = connect_async(&url)
-        .await
-        .context("Failed to connect to CLOB WebSocket")?;
-
-    let (mut write, mut read) = ws_stream.split();
-
     let sub = serde_json::json!({
-        "assets_ids": asset_ids,
+        "assets_ids": asset_ids.clone(),
         "type": "market"
     });
-    let sub_msg = Message::Text(serde_json::to_string(&sub)?);
-    write.send(sub_msg).await.context("Send subscribe failed")?;
-    info!("Subscribed to {} assets", asset_ids.len());
+    let sub_body = serde_json::to_string(&sub)?;
 
-    while let Some(msg) = read.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                if text == "PONG" || text == "pong" {
-                    continue;
-                }
-                if let Err(e) = process_message(&text, &prices).await {
-                    debug!("WS parse error: {} for message: {}", e, &text[..text.len().min(200)]);
-                }
-            }
-            Ok(Message::Ping(data)) => {
-                let _ = write.send(Message::Pong(data)).await;
-            }
-            Ok(Message::Close(_)) => {
-                info!("WebSocket closed by server");
-                break;
-            }
+    loop {
+        info!("Connecting to market WebSocket: {}", url);
+        let (ws_stream, _) = match connect_async(&url).await {
+            Ok(s) => s,
             Err(e) => {
-                error!("WebSocket error: {}", e);
-                break;
+                error!("WebSocket connect failed: {}. Reconnecting in {}s.", e, WS_RECONNECT_DELAY_SECS);
+                tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
+                continue;
             }
-            _ => {}
+        };
+
+        let (mut write, mut read) = ws_stream.split();
+        let sub_msg = Message::Text(sub_body.clone());
+        if let Err(e) = write.send(sub_msg).await {
+            error!("WebSocket send subscribe failed: {}. Reconnecting in {}s.", e, WS_RECONNECT_DELAY_SECS);
+            tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
+            continue;
+        }
+        info!("Subscribed to {} assets", asset_ids.len());
+
+        let mut disconnected = false;
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    if text == "PONG" || text == "pong" {
+                        continue;
+                    }
+                    if let Err(e) = process_message(&text, &prices).await {
+                        debug!("WS parse error: {} for message: {}", e, &text[..text.len().min(200)]);
+                    }
+                }
+                Ok(Message::Ping(data)) => {
+                    let _ = write.send(Message::Pong(data)).await;
+                }
+                Ok(Message::Close(_)) => {
+                    info!("WebSocket closed by server. Reconnecting in {}s.", WS_RECONNECT_DELAY_SECS);
+                    disconnected = true;
+                    break;
+                }
+                Err(e) => {
+                    error!("WebSocket error: {}. Reconnecting in {}s.", e, WS_RECONNECT_DELAY_SECS);
+                    disconnected = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if disconnected {
+            tokio::time::sleep(tokio::time::Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
+        } else {
+            break;
         }
     }
 
@@ -125,7 +156,7 @@ async fn process_message(text: &str, prices: &PricesSnapshot) -> Result<()> {
         let book: WsBookMessage = serde_json::from_value(v).context("Parse book")?;
         let bid = book.buys.first().and_then(|b| parse_f64(&b.price));
         let ask = book.sells.first().and_then(|a| parse_f64(&a.price));
-        if bid.is_some() || ask.is_some() {
+        if (bid.is_some() || ask.is_some()) && !is_placeholder_quote(bid, ask) {
             let mut w = prices.write().await;
             let entry = w.entry(book.asset_id).or_default();
             if let Some(b) = bid {
@@ -144,7 +175,7 @@ async fn process_message(text: &str, prices: &PricesSnapshot) -> Result<()> {
         for pc in msg.price_changes {
             let bid = pc.best_bid.and_then(|s| parse_f64(&s));
             let ask = pc.best_ask.and_then(|s| parse_f64(&s));
-            if bid.is_some() || ask.is_some() {
+            if (bid.is_some() || ask.is_some()) && !is_placeholder_quote(bid, ask) {
                 let entry = w.entry(pc.asset_id).or_default();
                 if let Some(b) = bid {
                     entry.bid = Some(b);

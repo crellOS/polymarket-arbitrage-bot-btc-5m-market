@@ -1,7 +1,9 @@
 mod api;
+mod chainlink;
 mod config;
 mod discovery;
 mod models;
+mod rtds;
 mod strategy;
 mod ws;
 
@@ -24,11 +26,8 @@ async fn main() -> Result<()> {
     let config = Config::load(&args.config)?;
 
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    eprintln!("📋 BTC 15m vs 5m arbitrage bot");
-    eprintln!("   sum_threshold     {}", config.strategy.sum_threshold);
-    eprintln!("   shares per side   {}", config.strategy.shares);
-    eprintln!("   verify_fill_secs  {}s", config.strategy.verify_fill_secs);
-    eprintln!("   simulation_mode   {}", config.strategy.simulation_mode);
+    eprintln!("📋 5m pre-order trading bot (BTC, ETH, SOL, XRP)");
+    eprintln!("   Price-to-beat: RTDS Chainlink per symbol for 5m period");
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     let api = Arc::new(PolymarketApi::new(
@@ -40,6 +39,7 @@ async fn main() -> Result<()> {
         config.polymarket.private_key.clone(),
         config.polymarket.proxy_wallet_address.clone(),
         config.polymarket.signature_type,
+        config.polymarket.rpc_url.clone(),
     ));
 
     if args.redeem {

@@ -1,479 +1,290 @@
-//! 15m vs 5m BTC arbitrage: only in last 5 min of 15m when price-to-beat matches;
-//! monitor via WebSocket; place both sides when sum of asks < threshold.
-//! After 10s: verify both filled; if only one side matched, sell that token and cancel the other order.
+//! 5m pre-order trading bot: BTC, ETH, SOL, XRP. Monitor live prices, revert view, and optionally place pre-orders.
+//! Price-to-beat from Polymarket RTDS Chainlink (crypto_prices_chainlink) per symbol.
 
 use crate::api::PolymarketApi;
+use crate::chainlink::run_chainlink_multi_poller;
 use crate::config::Config;
-use crate::discovery::{
-    current_15m_period_start, current_5m_period_start, is_last_5min_of_15m,
-    MarketDiscovery, MARKET_15M_DURATION_SECS, MARKET_5M_DURATION_SECS,
-};
-use crate::models::{OrderRequest, OrderResponse};
+use crate::discovery::{current_5m_period_start, MarketDiscovery};
+use crate::models::OrderRequest;
+use crate::rtds::PriceCacheMulti;
 use crate::ws::{run_market_ws, PricesSnapshot};
 use anyhow::Result;
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 use log::{error, info, warn};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 
-fn format_timestamp_iso(unix_secs: i64) -> String {
-    Utc.timestamp_opt(unix_secs, 0)
-        .single()
-        .map(|dt: chrono::DateTime<_>| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
-}
+const MARKET_5M_DURATION_SECS: i64 = 5 * 60; // 300
+const LIVE_PRICE_POLL_MS: u64 = 100;
 
-/// Returns (filled_a, filled_b). In simulation mode assumes both filled.
-async fn check_fill_status(
-    api: &PolymarketApi,
-    order_id_a: Option<&str>,
-    order_id_b: Option<&str>,
-    sim: bool,
-) -> (bool, bool) {
-    if sim {
-        return (true, true);
-    }
-    let ok_a = match order_id_a {
-        Some(id) => api.get_order_status(id).await.ok(),
-        None => None,
-    };
-    let ok_b = match order_id_b {
-        Some(id) => api.get_order_status(id).await.ok(),
-        None => None,
-    };
-    let filled_a = ok_a
-        .and_then(|s| {
-            let o: f64 = s.original_size.as_deref()?.parse().ok()?;
-            let m: f64 = s.size_matched.as_deref()?.parse().ok()?;
-            Some(o > 0.0 && m >= o - 0.001)
-        })
-        .unwrap_or(false);
-    let filled_b = ok_b
-        .and_then(|s| {
-            let o: f64 = s.original_size.as_deref()?.parse().ok()?;
-            let m: f64 = s.size_matched.as_deref()?.parse().ok()?;
-            Some(o > 0.0 && m >= o - 0.001)
-        })
-        .unwrap_or(false);
-    (filled_a, filled_b)
-}
-
-/// Parameters for verify-and-manage-risk: one arb leg (token A + token B and their order IDs).
-struct VerifyRiskParams {
-    token_a: String,
-    token_b: String,
-    order_id_a: Option<String>,
-    order_id_b: Option<String>,
-    shares: f64,
-    verify_secs: u64,
-    simulation: bool,
-    label_a: String,
-    label_b: String,
-}
-
-/// After verify_secs: confirm both filled; if only one filled, sell that token and cancel the other order.
-async fn verify_and_manage_risk(api: Arc<PolymarketApi>, p: VerifyRiskParams) {
-    sleep(Duration::from_secs(p.verify_secs)).await;
-    let (filled_a, filled_b) = check_fill_status(
-        &api,
-        p.order_id_a.as_deref(),
-        p.order_id_b.as_deref(),
-        p.simulation,
-    )
-    .await;
-
-    if filled_a && filled_b {
-        info!(
-            "Both orders confirmed filled ({} + {}). Ready for next opportunity.",
-            p.label_a, p.label_b
-        );
-        return;
-    }
-
-    if filled_a && !filled_b {
-        warn!(
-            "Only {} matched after {}s. Risk exit: selling {} and cancelling {} order.",
-            p.label_a, p.verify_secs, p.label_a, p.label_b
-        );
-        if p.simulation {
-            info!(
-                "🎮 SIMULATION: Would sell {} shares {} and cancel {} order",
-                p.shares, p.label_a, p.label_b
-            );
-        } else {
-            if let Err(e) = api.place_market_order(&p.token_a, p.shares, "SELL", None).await {
-                error!("Failed to sell {}: {}", p.label_a, e);
-            } else {
-                info!("Sold {} shares {}", p.shares, p.label_a);
-            }
-            if let Some(ref id) = p.order_id_b {
-                if let Err(e) = api.cancel_order(id).await {
-                    error!("Failed to cancel {} order: {}", p.label_b, e);
-                } else {
-                    info!("Cancelled {} order", p.label_b);
-                }
-            }
-        }
-        return;
-    }
-
-    if !filled_a && filled_b {
-        warn!(
-            "Only {} matched after {}s. Risk exit: selling {} and cancelling {} order.",
-            p.label_b, p.verify_secs, p.label_b, p.label_a
-        );
-        if p.simulation {
-            info!(
-                "🎮 SIMULATION: Would sell {} shares {} and cancel {} order",
-                p.shares, p.label_b, p.label_a
-            );
-        } else {
-            if let Err(e) = api.place_market_order(&p.token_b, p.shares, "SELL", None).await {
-                error!("Failed to sell {}: {}", p.label_b, e);
-            } else {
-                info!("Sold {} shares {}", p.shares, p.label_b);
-            }
-            if let Some(ref id) = p.order_id_a {
-                if let Err(e) = api.cancel_order(id).await {
-                    error!("Failed to cancel {} order: {}", p.label_a, e);
-                } else {
-                    info!("Cancelled {} order", p.label_a);
-                }
-            }
-        }
-        return;
-    }
-
-    warn!(
-        "Neither order matched after {}s. Cancelling both {} and {} orders.",
-        p.verify_secs, p.label_a, p.label_b
-    );
-    if !p.simulation {
-        if let Some(ref id) = p.order_id_a {
-            let _ = api.cancel_order(id).await;
-        }
-        if let Some(ref id) = p.order_id_b {
-            let _ = api.cancel_order(id).await;
-        }
-    }
-}
-
-/// Token IDs: 15m Up, 15m Down, 5m Up, 5m Down.
-pub struct ArbTokens {
-    pub m15_up: String,
-    pub m15_down: String,
-    pub m5_up: String,
-    pub m5_down: String,
+/// Round to cents for change detection (avoid log spam from tiny float changes).
+fn price_key(p: Option<f64>) -> u32 {
+    p.map(|v| (v * 100.0).round().max(0.0) as u32).unwrap_or(0)
 }
 
 pub struct ArbStrategy {
     api: Arc<PolymarketApi>,
     config: Config,
     discovery: MarketDiscovery,
+    /// symbol -> period_start -> price-to-beat (from RTDS Chainlink).
+    price_cache_5: PriceCacheMulti,
 }
 
 impl ArbStrategy {
     pub fn new(api: Arc<PolymarketApi>, config: Config) -> Self {
-        let discovery = MarketDiscovery::new(api.clone());
         Self {
+            discovery: MarketDiscovery::new(api.clone()),
             api,
             config,
-            discovery,
+            price_cache_5: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Wait until we're in the arbitrage window: last 5 min of 15m and same price-to-beat (from API).
-    /// Price-to-beat is not available at market start: we wait delay_secs (e.g. 30s) then poll every poll_interval_secs (e.g. 10s).
-    /// Returns (15m condition_id, 5m condition_id, tokens, 15m period_start).
-    async fn wait_for_arb_window(&self) -> Result<(String, String, ArbTokens, i64)> {
-        let delay_secs = self.config.strategy.price_to_beat_delay_secs as i64;
-        let poll_interval = self.config.strategy.price_to_beat_poll_interval_secs;
-
+    /// Wait until we have the current 5m market and its price-to-beat for the given symbol.
+    /// Returns (m5_cid, m5_up_token, m5_down_token, period_5, price_to_beat).
+    async fn wait_for_5m_market_and_price(&self, symbol: &str) -> Result<(String, String, String, i64, f64)> {
+        const WAIT_POLL_SECS: u64 = 10;
         loop {
-            let now = Utc::now().timestamp();
-            let period_15 = current_15m_period_start();
             let period_5 = current_5m_period_start();
-
-            if !is_last_5min_of_15m(now, period_15) {
-                let next_window = period_15 + 10 * 60;
-                info!(
-                    "Not in arb window (need last 5m of 15m). Next window in {}s. Sleeping 30s.",
-                    next_window - now
-                );
-                sleep(Duration::from_secs(30)).await;
-                continue;
-            }
-
-            let (m15, _) = match self.discovery.get_15m_market(period_15).await? {
+            let (m5_cid, _) = match self.discovery.get_5m_market(symbol, period_5).await? {
                 Some((cid, _)) => (cid, ()),
                 None => {
-                    warn!("15m market not found for period {}. Sleeping 10s.", period_15);
+                    warn!("5m {} market not found for period {}. Sleeping 10s.", symbol, period_5);
                     sleep(Duration::from_secs(10)).await;
                     continue;
                 }
             };
-            let (m5, _) = match self.discovery.get_5m_market(period_5).await? {
-                Some((cid, _)) => (cid, ()),
+            let price_to_beat = {
+                let cache = self.price_cache_5.read().await;
+                cache.get(symbol).and_then(|per_period| per_period.get(&period_5).copied())
+            };
+            let price_to_beat = match price_to_beat {
+                Some(p) => p,
                 None => {
-                    warn!("5m market not found for period {}. Sleeping 10s.", period_5);
-                    sleep(Duration::from_secs(10)).await;
+                    info!(
+                        "5m {} period {}: waiting for price-to-beat from RTDS Chainlink.",
+                        symbol, period_5
+                    );
+                    sleep(Duration::from_secs(WAIT_POLL_SECS)).await;
                     continue;
                 }
             };
-
-            // Price-to-beat API is not available until delay_secs after market start (15m ~2min, 5m ~30s; we use 30s for both).
-            let ready_at_15 = period_15 + delay_secs;
-            let ready_at_5 = period_5 + delay_secs;
-            if now < ready_at_15 || now < ready_at_5 {
-                let wait = (ready_at_15.max(ready_at_5) - now).max(1) as u64;
-                info!(
-                    "Waiting {}s for price-to-beat API (available {}s after market start).",
-                    wait, delay_secs
-                );
-                sleep(Duration::from_secs(wait)).await;
-                continue;
-            }
-
-            // Fetch price-to-beat for both markets. Use ISO times so they match slug btc-updown-15m-{period_15} / btc-updown-5m-{period_5}.
-            let event_start_15m_iso = format_timestamp_iso(period_15);
-            let end_date_15m_iso = format_timestamp_iso(period_15 + MARKET_15M_DURATION_SECS);
-            let event_start_5m_iso = format_timestamp_iso(period_5);
-            let end_date_5m_iso = format_timestamp_iso(period_5 + MARKET_5M_DURATION_SECS);
-
-            let m15_beat = self
-                .api
-                .get_crypto_price_to_beat("BTC", &event_start_15m_iso, "fifteen", &end_date_15m_iso)
-                .await?;
-            let m5_beat = self
-                .api
-                .get_crypto_price_to_beat("BTC", &event_start_5m_iso, "five", &end_date_5m_iso)
-                .await?;
-
-            let same_beat = match (m15_beat, m5_beat) {
-                (Some(a), Some(b)) => (a - b).abs() < 0.01,
-                _ => false,
-            };
-
-            if !same_beat {
-                info!(
-                    "Price-to-beat mismatch: 15m={:?} 5m={:?}. Polling again in {}s.",
-                    m15_beat, m5_beat, poll_interval
-                );
-                sleep(Duration::from_secs(poll_interval)).await;
-                continue;
-            }
-
+            let (m5_up, m5_down) = self.discovery.get_market_tokens(&m5_cid).await?;
             info!(
-                "Arb window active: 15m period {} (last 5m), 5m period {}, price-to-beat {:?}",
-                period_15, period_5, m15_beat
+                "5m {} market active: period_start={}, price-to-beat (RTDS Chainlink)={:.2} USD",
+                symbol, period_5, price_to_beat
             );
-
-            let (m15_up, m15_down) = self.discovery.get_market_tokens(&m15).await?;
-            let (m5_up, m5_down) = self.discovery.get_market_tokens(&m5).await?;
-
-            return Ok((
-                m15,
-                m5,
-                ArbTokens {
-                    m15_up,
-                    m15_down,
-                    m5_up,
-                    m5_down,
-                },
-                period_15,
-            ));
+            return Ok((m5_cid, m5_up, m5_down, period_5, price_to_beat));
         }
     }
 
-    fn round_price(price: f64) -> f64 {
-        let rounded = (price * 100.0).round() / 100.0;
-        rounded.clamp(0.01, 0.99)
-    }
-
-    async fn place_limit_buy(&self, token_id: &str, price: f64) -> Result<OrderResponse> {
-        let price = Self::round_price(price);
-        let shares = self.config.strategy.shares;
-        if self.config.strategy.simulation_mode {
-            info!(
-                "🎮 SIMULATION: Would place BUY {} shares @ ${:.4} for token {}",
-                shares, price, &token_id[..token_id.len().min(12)]
-            );
-            return Ok(OrderResponse {
-                order_id: Some(format!("SIM-{}", Utc::now().timestamp())),
-                status: "SIMULATED".to_string(),
-                message: Some("Simulated".to_string()),
-            });
+    /// Resolve pre-order side: "up" | "down" | "favor" (market favors = lower ask).
+    fn pre_order_side(&self, market_favors_up: bool) -> &'static str {
+        let side = self.config.strategy.pre_order_side.to_lowercase();
+        match side.as_str() {
+            "up" => "up",
+            "down" => "down",
+            "favor" => if market_favors_up { "up" } else { "down" },
+            _ => if market_favors_up { "up" } else { "down" },
         }
-        let order = OrderRequest {
-            token_id: token_id.to_string(),
-            side: "BUY".to_string(),
-            size: shares.to_string(),
-            price: price.to_string(),
-            order_type: "LIMIT".to_string(),
-        };
-        self.api.place_order(&order).await
     }
 
-    /// One arb round: run WebSocket until market ends; when sum < threshold place orders, wait 10s, verify, repeat.
-    async fn run_arb_round(
+    /// Run one 5m round: subscribe to 5m prices, log revert view, optionally place one pre-order per period.
+    async fn run_5m_round(
         &self,
-        tokens: &ArbTokens,
-        period_15_start: i64,
+        symbol: &str,
+        _m5_cid: &str,
+        m5_up: &str,
+        m5_down: &str,
+        period_5: i64,
+        price_to_beat: f64,
     ) -> Result<()> {
-        let prices: PricesSnapshot = Arc::new(RwLock::new(Default::default()));
-        let asset_ids = vec![
-            tokens.m15_up.clone(),
-            tokens.m15_down.clone(),
-            tokens.m5_up.clone(),
-            tokens.m5_down.clone(),
-        ];
+        let prices: PricesSnapshot = Arc::new(RwLock::new(HashMap::new()));
+        let asset_ids = vec![m5_up.to_string(), m5_down.to_string()];
         let ws_url = self.config.polymarket.ws_url.clone();
         let prices_clone = Arc::clone(&prices);
+        let symbol_ws = symbol.to_string();
         let ws_handle = tokio::spawn(async move {
             if let Err(e) = run_market_ws(&ws_url, asset_ids, prices_clone).await {
-                warn!("WebSocket exited: {}", e);
+                warn!("5m {} round WebSocket exited: {}", symbol_ws, e);
             }
         });
 
-        let threshold = self.config.strategy.sum_threshold;
-        let verify_secs = self.config.strategy.verify_fill_secs;
-        let mut pending_placement = false;
-        let mut last_place_time = 0i64;
+        let mut last_key: Option<(u32, u32, u32, u32)> = None;
+        let mut pre_order_placed = false;
+        let pre_order_enabled = self.config.strategy.pre_order_enabled && !self.config.strategy.simulation_mode;
 
         loop {
             let now = Utc::now().timestamp();
-            if now >= period_15_start + MARKET_15M_DURATION_SECS {
-                info!("15m market ended. Exiting arb round.");
+            if now >= period_5 + MARKET_5M_DURATION_SECS {
+                info!("5m {} market ended (period {}). Exiting round.", symbol, period_5);
                 break;
             }
-
-            if pending_placement {
-                let elapsed = now - last_place_time;
-                if elapsed >= verify_secs as i64 {
-                    pending_placement = false;
-                    // Verification is done in the block below when we set pending_placement = true
-                }
-                sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-
             let snap = prices.read().await;
-            let m15_up_ask = snap.get(&tokens.m15_up).and_then(|p| p.ask);
-            let m15_down_ask = snap.get(&tokens.m15_down).and_then(|p| p.ask);
-            let m5_up_ask = snap.get(&tokens.m5_up).and_then(|p| p.ask);
-            let m5_down_ask = snap.get(&tokens.m5_down).and_then(|p| p.ask);
+            let ask_up = snap.get(m5_up).and_then(|p| p.ask);
+            let ask_down = snap.get(m5_down).and_then(|p| p.ask);
+            let bid_up = snap.get(m5_up).and_then(|p| p.bid);
+            let bid_down = snap.get(m5_down).and_then(|p| p.bid);
+            let key = (price_key(bid_up), price_key(ask_up), price_key(bid_down), price_key(ask_down));
+            if (ask_up.is_some() || ask_down.is_some()) && last_key != Some(key) {
+                last_key = Some(key);
+                let (au, ad) = (ask_up.unwrap_or(0.0), ask_down.unwrap_or(0.0));
+                let market_favors_up = au < ad;
+                info!(
+                    "  {} Revert view: market favors {} | could revert to {} if {} {} ${:.2}",
+                    symbol.to_uppercase(),
+                    if market_favors_up { "Up" } else { "Down" },
+                    if market_favors_up { "Down" } else { "Up" },
+                    symbol.to_uppercase(),
+                    if market_favors_up { "drops below" } else { "rises above" },
+                    price_to_beat
+                );
+
+                // Pre-order: place one limit BUY per period when we have a valid best ask.
+                if pre_order_enabled && !pre_order_placed {
+                    let side = self.pre_order_side(market_favors_up);
+                    let (token_id, best_ask) = if side == "up" {
+                        (m5_up, ask_up)
+                    } else {
+                        (m5_down, ask_down)
+                    };
+                    if let Some(ask) = best_ask {
+                        let ticks = self.config.strategy.pre_order_improve_ticks as f64 * 0.01;
+                        let price = (ask - ticks).max(0.01);
+                        let size = self.config.strategy.pre_order_size.clone();
+                        let order = OrderRequest {
+                            token_id: token_id.to_string(),
+                            side: "BUY".to_string(),
+                            size,
+                            price: format!("{:.4}", price),
+                            order_type: "GTC".to_string(),
+                        };
+                        drop(snap);
+                        match self.api.place_order(&order).await {
+                            Ok(_) => {
+                                info!("  {} Pre-order placed: BUY {} @ {:.4} ({})", symbol.to_uppercase(), order.size, price, side);
+                                pre_order_placed = true;
+                            }
+                            Err(e) => {
+                                warn!("  {} Pre-order failed: {}", symbol.to_uppercase(), e);
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
             drop(snap);
-
-            let (sum1, sum2) = (
-                m15_up_ask.zip(m5_down_ask).map(|(a, b)| a + b),
-                m15_down_ask.zip(m5_up_ask).map(|(a, b)| a + b),
-            );
-
-            let (do_place_1, do_place_2) = (
-                sum1.map(|s| s < threshold).unwrap_or(false),
-                sum2.map(|s| s < threshold).unwrap_or(false),
-            );
-
-            if do_place_1 {
-                let ask_a = m15_up_ask.unwrap();
-                let ask_b = m5_down_ask.unwrap();
-                info!(
-                    "Arb opportunity: 15m Up ask {:.4} + 5m Down ask {:.4} = {:.4} < {:.2} — placing both",
-                    ask_a, ask_b, ask_a + ask_b, threshold
-                );
-                let r1 = self.place_limit_buy(&tokens.m15_up, ask_a).await;
-                let r2 = self.place_limit_buy(&tokens.m5_down, ask_b).await;
-                match (&r1, &r2) {
-                    (Ok(_), Ok(_)) => {
-                        pending_placement = true;
-                        last_place_time = Utc::now().timestamp();
-                        let api = self.api.clone();
-                        let params = VerifyRiskParams {
-                            token_a: tokens.m15_up.clone(),
-                            token_b: tokens.m5_down.clone(),
-                            order_id_a: r1.as_ref().ok().and_then(|o| o.order_id.clone()),
-                            order_id_b: r2.as_ref().ok().and_then(|o| o.order_id.clone()),
-                            shares: self.config.strategy.shares,
-                            verify_secs: self.config.strategy.verify_fill_secs,
-                            simulation: self.config.strategy.simulation_mode,
-                            label_a: "15m Up".to_string(),
-                            label_b: "5m Down".to_string(),
-                        };
-                        tokio::spawn(async move {
-                            verify_and_manage_risk(api, params).await;
-                        });
-                    }
-                    _ => {
-                        error!("Place failed: {:?} / {:?}", r1, r2);
-                    }
-                }
-                sleep(Duration::from_millis(200)).await;
-                continue;
-            }
-
-            if do_place_2 {
-                let ask_a = m15_down_ask.unwrap();
-                let ask_b = m5_up_ask.unwrap();
-                info!(
-                    "Arb opportunity: 15m Down ask {:.4} + 5m Up ask {:.4} = {:.4} < {:.2} — placing both",
-                    ask_a, ask_b, ask_a + ask_b, threshold
-                );
-                let r1 = self.place_limit_buy(&tokens.m15_down, ask_a).await;
-                let r2 = self.place_limit_buy(&tokens.m5_up, ask_b).await;
-                match (&r1, &r2) {
-                    (Ok(_), Ok(_)) => {
-                        pending_placement = true;
-                        last_place_time = Utc::now().timestamp();
-                        let api = self.api.clone();
-                        let params = VerifyRiskParams {
-                            token_a: tokens.m15_down.clone(),
-                            token_b: tokens.m5_up.clone(),
-                            order_id_a: r1.as_ref().ok().and_then(|o| o.order_id.clone()),
-                            order_id_b: r2.as_ref().ok().and_then(|o| o.order_id.clone()),
-                            shares: self.config.strategy.shares,
-                            verify_secs: self.config.strategy.verify_fill_secs,
-                            simulation: self.config.strategy.simulation_mode,
-                            label_a: "15m Down".to_string(),
-                            label_b: "5m Up".to_string(),
-                        };
-                        tokio::spawn(async move {
-                            verify_and_manage_risk(api, params).await;
-                        });
-                    }
-                    _ => {
-                        error!("Place failed: {:?} / {:?}", r1, r2);
-                    }
-                }
-                sleep(Duration::from_millis(200)).await;
-                continue;
-            }
-
-            sleep(Duration::from_millis(20)).await;
+            sleep(Duration::from_millis(LIVE_PRICE_POLL_MS)).await;
         }
-
         ws_handle.abort();
         Ok(())
     }
 
-    pub async fn run(&self) -> Result<()> {
-        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        info!("BTC 15m vs 5m arbitrage bot");
-        info!("   Sum threshold: {} (place when sum of asks < this)", self.config.strategy.sum_threshold);
-        info!("   Shares per side: {}", self.config.strategy.shares);
-        info!("   Verify fill after {}s", self.config.strategy.verify_fill_secs);
-        if self.config.strategy.simulation_mode {
-            info!("   🎮 SIMULATION MODE — no real orders");
-        }
-        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
+    /// Poll until 5m market is closed and resolved; returns winning outcome (e.g. "Up" or "Down").
+    async fn poll_until_5m_resolved(&self, symbol: &str, _m5_cid: &str) -> Option<String> {
+        const INITIAL_DELAY_SECS: u64 = 60;
+        const POLL_INTERVAL_SECS: u64 = 45;
+        const MAX_WAIT_SECS: u64 = 600;
+        info!(
+            "5m {} market end: waiting {}s then polling every {}s for resolution (max {}s).",
+            symbol, INITIAL_DELAY_SECS, POLL_INTERVAL_SECS, MAX_WAIT_SECS
+        );
+        sleep(Duration::from_secs(INITIAL_DELAY_SECS)).await;
+        let started = std::time::Instant::now();
         loop {
-            let (m15_cid, m5_cid, tokens, period_15) = self.wait_for_arb_window().await?;
-            info!("Running arb round: 15m {} … 5m {} …", &m15_cid[..20], &m5_cid[..20]);
-            if let Err(e) = self.run_arb_round(&tokens, period_15).await {
-                error!("Arb round error: {}", e);
+            if started.elapsed().as_secs() >= MAX_WAIT_SECS {
+                warn!("5m {} resolution timeout within {}s.", symbol, MAX_WAIT_SECS);
+                return None;
             }
+            let m = match self.api.get_market(_m5_cid).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("Poll 5m {} market failed: {}", symbol, e);
+                    sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+                    continue;
+                }
+            };
+            let winner = m
+                .tokens
+                .iter()
+                .find(|t| t.winner)
+                .map(|t| {
+                    if t.outcome.to_uppercase().contains("UP") || t.outcome == "1" {
+                        "Up".to_string()
+                    } else {
+                        "Down".to_string()
+                    }
+                });
+            if m.closed && winner.is_some() {
+                info!("5m {} market resolved: winner {}", symbol, winner.as_deref().unwrap_or("?"));
+                return winner;
+            }
+            sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        }
+    }
+
+    /// Per-symbol loop: wait for market + price, run round, poll resolution, repeat.
+    async fn run_symbol_loop(
+        api: Arc<PolymarketApi>,
+        config: Config,
+        price_cache_5: PriceCacheMulti,
+        symbol: String,
+    ) -> Result<()> {
+        let discovery = MarketDiscovery::new(api.clone());
+        let strategy = Self {
+            api,
+            config,
+            discovery,
+            price_cache_5,
+        };
+        loop {
+            let (m5_cid, m5_up, m5_down, period_5, price_to_beat) =
+                strategy.wait_for_5m_market_and_price(&symbol).await?;
+            if let Err(e) = strategy
+                .run_5m_round(&symbol, &m5_cid, &m5_up, &m5_down, period_5, price_to_beat)
+                .await
+            {
+                error!("5m {} round error: {}", symbol, e);
+            }
+            let _ = strategy.poll_until_5m_resolved(&symbol, &m5_cid).await;
             sleep(Duration::from_secs(5)).await;
         }
+    }
+
+    pub async fn run(&self) -> Result<()> {
+        let symbols = &self.config.strategy.symbols;
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        info!("5m pre-order trading bot (symbols: {:?})", symbols);
+        info!("   Price-to-beat: Polymarket RTDS Chainlink (crypto_prices_chainlink)");
+        info!("   Pre-order: enabled={}, side={}, size={}", 
+            self.config.strategy.pre_order_enabled, 
+            self.config.strategy.pre_order_side, 
+            self.config.strategy.pre_order_size);
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+        let rtds_url = self.config.polymarket.rtds_ws_url.clone();
+        let cache_15: PriceCacheMulti = Arc::new(RwLock::new(HashMap::new()));
+        let cache_5 = Arc::clone(&self.price_cache_5);
+        let symbols_rtds = symbols.clone();
+        if let Err(e) = run_chainlink_multi_poller(rtds_url, symbols_rtds, cache_15, cache_5).await {
+            warn!("RTDS Chainlink multi poller start: {}", e);
+        }
+        sleep(Duration::from_secs(2)).await;
+
+        let mut handles = Vec::new();
+        for symbol in symbols.clone() {
+            let api = Arc::clone(&self.api);
+            let config = self.config.clone();
+            let price_cache_5 = Arc::clone(&self.price_cache_5);
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = Self::run_symbol_loop(api, config, price_cache_5, symbol.clone()).await {
+                    error!("Symbol loop {} failed: {}", symbol, e);
+                }
+            }));
+        }
+        futures_util::future::try_join_all(handles).await?;
+        Ok(())
     }
 }

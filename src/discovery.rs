@@ -1,30 +1,69 @@
 use crate::api::PolymarketApi;
 use anyhow::Result;
+use chrono::{TimeZone, Timelike};
+use chrono_tz::America::New_York;
 use std::sync::Arc;
 
 pub const MARKET_15M_DURATION_SECS: i64 = 15 * 60; // 900
 pub const MARKET_5M_DURATION_SECS: i64 = 5 * 60;  // 300
+
+/// Polymarket aligns 15m/5m markets to Eastern Time (ET). Period start = start of current window in ET, as Unix timestamp.
+fn period_start_et_unix(minutes: i64) -> i64 {
+    let utc_now = chrono::Utc::now();
+    let et = New_York;
+    let now_et = utc_now.with_timezone(&et);
+    let minute_floor = (now_et.minute() as i64 / minutes) * minutes;
+    let truncated_naive = now_et
+        .date_naive()
+        .and_hms_opt(now_et.hour(), minute_floor as u32, 0)
+        .unwrap();
+    let dt_et = et
+        .from_local_datetime(&truncated_naive)
+        .single()
+        .or_else(|| et.from_local_datetime(&truncated_naive).earliest())
+        .expect("ET period start");
+    dt_et.timestamp()
+}
 
 /// BTC 15m slug: btc-updown-15m-{timestamp}
 pub fn build_15m_slug(period_start_unix: i64) -> String {
     format!("btc-updown-15m-{}", period_start_unix)
 }
 
-/// BTC 5m slug: btc-updown-5m-{timestamp}
-pub fn build_5m_slug(period_start_unix: i64) -> String {
-    format!("btc-updown-5m-{}", period_start_unix)
+/// 5m slug for any symbol: {symbol}-updown-5m-{timestamp} (e.g. btc, eth, sol, xrp).
+pub fn build_5m_slug(symbol: &str, period_start_unix: i64) -> String {
+    format!("{}-updown-5m-{}", symbol.to_lowercase(), period_start_unix)
 }
 
-/// Current 15-minute period start (Unix, aligned to 15m boundaries).
+/// Current 15-minute period start (Unix). Aligned to 15m boundaries in Eastern Time (Polymarket uses ET).
 pub fn current_15m_period_start() -> i64 {
-    let now = chrono::Utc::now().timestamp();
-    (now / MARKET_15M_DURATION_SECS) * MARKET_15M_DURATION_SECS
+    period_start_et_unix(15)
 }
 
-/// Current 5-minute period start (Unix, aligned to 5m boundaries).
+/// Current 5-minute period start (Unix). Aligned to 5m boundaries in Eastern Time (Polymarket uses ET).
 pub fn current_5m_period_start() -> i64 {
-    let now = chrono::Utc::now().timestamp();
-    (now / MARKET_5M_DURATION_SECS) * MARKET_5M_DURATION_SECS
+    period_start_et_unix(5)
+}
+
+/// ET-aligned period start (Unix) that contains the given timestamp. Used to match RTDS price timestamp to market.
+pub fn period_start_et_unix_for_timestamp(ts_sec: i64, minutes: i64) -> i64 {
+    let utc_dt = match chrono::Utc.timestamp_opt(ts_sec, 0).single() {
+        Some(dt) => dt,
+        None => return ts_sec,
+    };
+    let et = New_York;
+    let et_dt = utc_dt.with_timezone(&et);
+    let minute_floor = (et_dt.minute() as i64 / minutes) * minutes;
+    let truncated_naive = et_dt
+        .date_naive()
+        .and_hms_opt(et_dt.hour(), minute_floor as u32, 0)
+        .unwrap();
+    let dt_et = et
+        .from_local_datetime(&truncated_naive)
+        .single()
+        .or_else(|| et.from_local_datetime(&truncated_naive).earliest())
+        .expect("ET period for timestamp");
+    dt_et.timestamp()
 }
 
 /// True when we're in the last 5 minutes of the current 15m market (overlap with 5m for arb).
@@ -103,9 +142,9 @@ impl MarketDiscovery {
         Ok(Some((market.condition_id, price_to_beat)))
     }
 
-    /// Fetch BTC 5m market by period start; returns condition_id and price-to-beat if parseable.
-    pub async fn get_5m_market(&self, period_start: i64) -> Result<Option<(String, Option<f64>)>> {
-        let slug = build_5m_slug(period_start);
+    /// Fetch 5m market by symbol and period start; returns condition_id and price-to-beat if parseable.
+    pub async fn get_5m_market(&self, symbol: &str, period_start: i64) -> Result<Option<(String, Option<f64>)>> {
+        let slug = build_5m_slug(symbol, period_start);
         let market = match self.api.get_market_by_slug(&slug).await {
             Ok(m) => m,
             Err(_) => return Ok(None),

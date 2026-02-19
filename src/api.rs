@@ -48,6 +48,7 @@ pub struct PolymarketApi {
     private_key: Option<String>,
     proxy_wallet_address: Option<String>,
     signature_type: Option<u8>,
+    rpc_url: Option<String>,
     authenticated: Arc<tokio::sync::Mutex<bool>>,
 }
 
@@ -61,12 +62,12 @@ impl PolymarketApi {
         private_key: Option<String>,
         proxy_wallet_address: Option<String>,
         signature_type: Option<u8>,
+        rpc_url: Option<String>,
     ) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("Failed to create HTTP client");
-        
         Self {
             client,
             gamma_url,
@@ -77,6 +78,7 @@ impl PolymarketApi {
             private_key,
             proxy_wallet_address,
             signature_type,
+            rpc_url,
             authenticated: Arc::new(tokio::sync::Mutex::new(false)),
         }
     }
@@ -225,9 +227,8 @@ impl PolymarketApi {
 
     /// Fetch price-to-beat (openPrice) from Polymarket crypto-price API.
     /// Not available immediately at market start: 15m ~2 min, 5m ~30 sec. Call after delay and poll.
-    /// variant: "fifteen" for 15m market, "five" for 5m market.
-    /// event_start_iso and end_date_iso must be in ISO 8601 UTC (e.g. "2026-02-13T12:45:00Z") so the API
-    /// returns the correct open price for the market identified by slug btc-updown-{15m|5m}-{timestamp}.
+    /// variant: "fifteen" for 15m market, "fiveminute" for 5m market (per Polymarket platform).
+    /// event_start_iso and end_date_iso must be ISO 8601 UTC with Z (e.g. "2026-02-14T13:45:00Z").
     pub async fn get_crypto_price_to_beat(
         &self,
         symbol: &str,
@@ -236,7 +237,7 @@ impl PolymarketApi {
         end_date_iso: &str,
     ) -> Result<Option<f64>> {
         const CRYPTO_PRICE_URL: &str = "https://polymarket.com/api/crypto/crypto-price";
-        let response = self
+        let req = self
             .client
             .get(CRYPTO_PRICE_URL)
             .query(&[
@@ -245,7 +246,11 @@ impl PolymarketApi {
                 ("variant", variant),
                 ("endDate", end_date_iso),
             ])
-            .send()
+            .build()
+            .context("Failed to build crypto price-to-beat request")?;
+        let response = self
+            .client
+            .execute(req)
             .await
             .context("Failed to fetch crypto price-to-beat")?;
         if !response.status().is_success() {
@@ -424,8 +429,11 @@ impl PolymarketApi {
         eprintln!("📤 Creating and posting order: {} {} {} @ {}", 
               order.side, order.size, order.token_id, order.price);
 
-        let token_id_u256 = U256::from_str_radix(order.token_id.trim_start_matches("0x"), 16)
-            .context(format!("Failed to parse token_id as U256: {}", order.token_id))?;
+        let token_id_u256 = if order.token_id.starts_with("0x") {
+            U256::from_str_radix(order.token_id.trim_start_matches("0x"), 16)
+        } else {
+            U256::from_str_radix(&order.token_id, 10)
+        }.context(format!("Failed to parse token_id as U256: {}", order.token_id))?;
 
         let order_builder = client
             .limit_order()
@@ -575,8 +583,11 @@ impl PolymarketApi {
         
         eprintln!("   Using current market price: ${:.4} for {} order", market_price, side);
 
-        let token_id_u256 = U256::from_str_radix(token_id.trim_start_matches("0x"), 16)
-            .context(format!("Failed to parse token_id as U256: {}", token_id))?;
+        let token_id_u256 = if token_id.starts_with("0x") {
+            U256::from_str_radix(token_id.trim_start_matches("0x"), 16)
+        } else {
+            U256::from_str_radix(token_id, 10)
+        }.context(format!("Failed to parse token_id as U256: {}", token_id))?;
 
         let order_builder = client
             .limit_order()
@@ -869,7 +880,7 @@ impl PolymarketApi {
               condition_id, outcome, index_set);
         
         const CTF_CONTRACT: &str = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
-        const RPC_URL: &str = "https://polygon-rpc.com";
+        let rpc_url = self.rpc_url.as_deref().unwrap_or("https://polygon-rpc.com");
         // Polymarket Proxy Wallet Factory (MagicLink users) – execute via factory.proxy([call])
         const PROXY_WALLET_FACTORY: &str = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052";
         
@@ -913,14 +924,17 @@ impl PolymarketApi {
             let nonce_selector = keccak256("nonce()".as_bytes());
             let nonce_calldata: Vec<u8> = nonce_selector.as_slice()[..4].to_vec();
             let provider_read = ProviderBuilder::new()
-                .connect(RPC_URL)
+                .connect(rpc_url)
                 .await
                 .context("Failed to connect to RPC for Safe read calls")?;
             let nonce_tx = TransactionRequest::default()
                 .to(safe_address)
                 .input(Bytes::from(nonce_calldata.clone()).into());
             let nonce_result = provider_read.call(nonce_tx).await
-                .context("Failed to call Safe.nonce()")?;
+                .map_err(|e| anyhow::anyhow!("Failed to call Safe.nonce() on {}: {}. \
+                    If you use MagicLink/email login, your proxy is a Polymarket custom proxy, not a Gnosis Safe; \
+                    redemption via Safe is only supported for MetaMask (Gnosis Safe) proxies.",
+                    safe_address_str, e))?;
             let nonce_bytes: [u8; 32] = nonce_result.as_ref().try_into()
                 .map_err(|_| anyhow::anyhow!("Safe.nonce() did not return 32 bytes"))?;
             let nonce = U256::from_be_slice(&nonce_bytes);
@@ -1055,7 +1069,7 @@ impl PolymarketApi {
         
         let provider = ProviderBuilder::new()
             .wallet(signer.clone())
-            .connect(RPC_URL)
+            .connect(rpc_url)
             .await
             .context("Failed to connect to Polygon RPC")?;
         
@@ -1119,4 +1133,67 @@ impl PolymarketApi {
         }
         Ok(redeem_response)
     }
+}
+
+// --- Chainlink BTC/USD price via Ethereum RPC (for price-to-beat) ---
+
+fn chainlink_latest_round_selector() -> [u8; 4] {
+    let h = keccak256(b"latestRoundData()");
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// Fetch current BTC/USD price from Chainlink data feed via eth_call.
+/// Returns (price_usd, updated_at_unix_secs) or error description for logging.
+pub async fn get_chainlink_btc_price_usd(
+    client: &Client,
+    rpc_url: &str,
+    proxy_address: &str,
+) -> Result<(f64, u64), String> {
+    let to = proxy_address.trim_start_matches("0x");
+    let data = "0x".to_string() + &hex::encode(chainlink_latest_round_selector());
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": format!("0x{}", to), "data": &data}, "latest"],
+        "id": 1
+    });
+    let res = client
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {}", e))?;
+    let status = res.status();
+    let text = res.text().await.map_err(|e| format!("read body: {}", e))?;
+    let json: Value = serde_json::from_str(&text).map_err(|e| {
+        let body_preview = text.trim();
+        let preview = if body_preview.len() > 200 {
+            format!("{}...", &body_preview[..200])
+        } else {
+            body_preview.to_string()
+        };
+        format!("json parse: {}; status={}; body_len={}; body={:?}", e, status, text.len(), preview)
+    })?;
+    if let Some(err) = json.get("error") {
+        return Err(format!("RPC error: {}; status={}", err, status));
+    }
+    let hex_result = json
+        .get("result")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("no 'result' in response; keys={:?}", json.as_object().map(|o| o.keys().collect::<Vec<_>>())))?;
+    let hex_result = hex_result.strip_prefix("0x").unwrap_or(hex_result);
+    if hex_result.len() < 64 * 5 {
+        return Err(format!("result too short (need 320 hex chars): got {}", hex_result.len()));
+    }
+    let raw = hex::decode(hex_result).map_err(|e| format!("hex decode: {}", e))?;
+    let answer_slice = raw.get(32..64).ok_or_else(|| format!("raw len {}", raw.len()))?;
+    let answer = i128::from_be_bytes(
+        answer_slice[16..32]
+            .try_into()
+            .map_err(|_| "answer slice".to_string())?,
+    );
+    let price = (answer as f64) / 100_000_000.0;
+    let updated_slice = raw.get(96..128).ok_or("updatedAt slice")?;
+    let updated_at = u64::from_be_bytes(updated_slice[24..32].try_into().map_err(|_| "updatedAt bytes")?);
+    Ok((price, updated_at))
 }
