@@ -26,8 +26,8 @@ async fn main() -> Result<()> {
     let config = Config::load(&args.config)?;
 
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    eprintln!("📋 5m pre-order trading bot (BTC, ETH, SOL, XRP)");
-    eprintln!("   Price-to-beat: RTDS Chainlink per symbol for 5m period");
+    eprintln!("📋 15m vs 5m arbitrage (BTC, ETH, SOL, XRP) — overlap, per-symbol tolerance");
+    eprintln!("   All symbols via parallel WebSocket; arb when sum < threshold & |P15−P5| ≤ tolerance");
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     let api = Arc::new(PolymarketApi::new(

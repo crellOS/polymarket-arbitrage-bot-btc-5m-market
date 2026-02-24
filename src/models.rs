@@ -90,6 +90,27 @@ pub struct TokenPrice {
     pub ask: Option<Decimal>,
 }
 
+/// Record of an arb trade for PnL tracking and redeem.
+#[derive(Debug, Clone)]
+pub struct TradeRecord {
+    pub symbol: String,
+    pub period_15: i64,
+    pub period_5: i64,
+    pub cid_15: String,
+    pub cid_5: String,
+    /// Leg 1: token_id, price, condition_id (15m or 5m), outcome "Up" or "Down"
+    pub leg1_token: String,
+    pub leg1_price: f64,
+    pub leg1_cid: String,
+    pub leg1_outcome: String,
+    /// Leg 2
+    pub leg2_token: String,
+    pub leg2_price: f64,
+    pub leg2_cid: String,
+    pub leg2_outcome: String,
+    pub size: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fill {
     #[serde(rename = "tokenID")]

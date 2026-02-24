@@ -4,9 +4,6 @@ use chrono::{TimeZone, Timelike};
 use chrono_tz::America::New_York;
 use std::sync::Arc;
 
-pub const MARKET_15M_DURATION_SECS: i64 = 15 * 60; // 900
-pub const MARKET_5M_DURATION_SECS: i64 = 5 * 60;  // 300
-
 /// Polymarket aligns 15m/5m markets to Eastern Time (ET). Period start = start of current window in ET, as Unix timestamp.
 fn period_start_et_unix(minutes: i64) -> i64 {
     let utc_now = chrono::Utc::now();
@@ -25,9 +22,9 @@ fn period_start_et_unix(minutes: i64) -> i64 {
     dt_et.timestamp()
 }
 
-/// BTC 15m slug: btc-updown-15m-{timestamp}
-pub fn build_15m_slug(period_start_unix: i64) -> String {
-    format!("btc-updown-15m-{}", period_start_unix)
+/// 15m slug for any symbol: {symbol}-updown-15m-{timestamp} (e.g. btc, eth, sol, xrp).
+pub fn build_15m_slug(symbol: &str, period_start_unix: i64) -> String {
+    format!("{}-updown-15m-{}", symbol.to_lowercase(), period_start_unix)
 }
 
 /// 5m slug for any symbol: {symbol}-updown-5m-{timestamp} (e.g. btc, eth, sol, xrp).
@@ -128,9 +125,9 @@ impl MarketDiscovery {
         Ok((up, down))
     }
 
-    /// Fetch BTC 15m market by period start; returns condition_id and price-to-beat if parseable.
-    pub async fn get_15m_market(&self, period_start: i64) -> Result<Option<(String, Option<f64>)>> {
-        let slug = build_15m_slug(period_start);
+    /// Fetch 15m market by symbol and period start; returns condition_id and price-to-beat if parseable.
+    pub async fn get_15m_market(&self, symbol: &str, period_start: i64) -> Result<Option<(String, Option<f64>)>> {
+        let slug = build_15m_slug(symbol, period_start);
         let market = match self.api.get_market_by_slug(&slug).await {
             Ok(m) => m,
             Err(_) => return Ok(None),

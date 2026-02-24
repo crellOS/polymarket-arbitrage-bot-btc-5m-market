@@ -94,26 +94,21 @@ pub async fn run_rtds_chainlink_multi(
     );
 
     let (mut ws_stream, _) = connect_async(url).await.context("RTDS connect failed")?;
-    let subscriptions: Vec<serde_json::Value> = symbols
-        .iter()
-        .map(|s| {
-            let feed = rtds_feed_symbol(s);
-            serde_json::json!({
-                "topic": "crypto_prices_chainlink",
-                "type": "*",
-                "filters": format!("{{\"symbol\":\"{}\"}}", feed)
-            })
-        })
-        .collect();
+    // Polymarket RTDS: subscribe with empty filters to receive ALL Chainlink symbols (btc/usd, eth/usd, sol/usd, xrp/usd).
+    // Multiple subscription entries for the same topic may not all be applied; one subscription with filters="" streams everything.
     let sub = serde_json::json!({
         "action": "subscribe",
-        "subscriptions": subscriptions
+        "subscriptions": [{
+            "topic": "crypto_prices_chainlink",
+            "type": "*",
+            "filters": ""
+        }]
     });
     ws_stream
         .send(Message::Text(sub.to_string()))
         .await
         .context("RTDS send subscribe failed")?;
-    info!("RTDS subscribed to {} symbols", symbols.len());
+    info!("RTDS subscribed to crypto_prices_chainlink (all symbols); filtering for {:?}", symbols);
 
     let mut ping = interval(Duration::from_secs(PING_INTERVAL_SECS));
     ping.tick().await;
@@ -131,7 +126,12 @@ pub async fn run_rtds_chainlink_multi(
                                         Some(k) if symbol_set.contains(&k) => k,
                                         _ => continue,
                                     };
-                                    let ts_sec = p.timestamp / 1000;
+                                    // API docs: timestamp in Unix milliseconds; accept seconds if value is small.
+                                    let ts_sec = if p.timestamp > 1_000_000_000_000 {
+                                        p.timestamp / 1000
+                                    } else {
+                                        p.timestamp
+                                    };
                                     let period_15 = period_start_et_unix_for_timestamp(ts_sec, 15);
                                     let period_5 = period_start_et_unix_for_timestamp(ts_sec, 5);
                                     let in_capture_15 = ts_sec >= period_15 && ts_sec < period_15 + FEED_TS_CAPTURE_WINDOW_SECS;

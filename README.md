@@ -60,7 +60,7 @@ A high-performance **Rust** arbitrage bot for [Polymarket](https://polymarket.co
 ## Installation
 
 ```bash
-git clone https://github.com/crellos/polymarket-trading-bot-btc-5m-market.git
+git clone https://github.com/crellos/polymarket-trading-bot-5m-markets.git
 cd polymarket-trading-bot-btc-5m-market
 cargo build --release
 ```

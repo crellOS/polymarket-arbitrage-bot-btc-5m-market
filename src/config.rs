@@ -21,32 +21,41 @@ pub struct Config {
     pub strategy: StrategyConfig,
 }
 
-/// 5m pre-order trading: symbols to trade, pre-order size/side/improvement.
+/// 15m vs 5m arbitrage: trade overlap window; per-symbol price-to-beat tolerance (USD).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyConfig {
-    /// 5m market symbols (e.g. btc, eth, sol, xrp). Slug format: {symbol}-updown-5m-{period}.
+    /// Symbols to arb (15m vs 5m overlap). e.g. ["btc", "eth", "sol", "xrp"].
     #[serde(default = "default_symbols")]
     pub symbols: Vec<String>,
     /// Max sum of (15m one side ask + 5m opposite side ask) to trigger arb (e.g. 0.99).
     #[serde(default = "default_sum_threshold")]
     pub sum_threshold: f64,
-    /// Seconds to wait after placing orders before checking if both filled.
-    #[serde(default = "default_verify_fill_secs")]
-    pub verify_fill_secs: u64,
+    /// Seconds to wait after placing an arb before placing the next one (cooldown).
+    #[serde(default = "default_trade_interval_secs")]
+    pub trade_interval_secs: u64,
     #[serde(default)]
     pub simulation_mode: bool,
-    /// Enable pre-order: place one limit buy per 5m market per period.
-    #[serde(default)]
-    pub pre_order_enabled: bool,
-    /// Pre-order size in shares (e.g. "10").
-    #[serde(default = "default_pre_order_size")]
-    pub pre_order_size: String,
-    /// Pre-order side: "up", "down", or "favor" (side the market currently favors).
-    #[serde(default = "default_pre_order_side")]
-    pub pre_order_side: String,
-    /// Ticks to improve vs best ask (1 tick = 0.01). 0 = use best ask.
-    #[serde(default)]
-    pub pre_order_improve_ticks: u32,
+    /// Size in shares per leg (15m and 5m).
+    #[serde(default = "default_arb_shares")]
+    pub arb_shares: String,
+    /// Per-symbol max |15m price-to-beat − 5m price-to-beat| (USD) to allow arb.
+    #[serde(default, alias = "price_to_beat_tolerance_usd")]
+    pub btc_price_to_beat_tolerance_usd: f64,
+    #[serde(default = "default_eth_tolerance")]
+    pub eth_price_to_beat_tolerance_usd: f64,
+    #[serde(default = "default_sol_tolerance")]
+    pub sol_price_to_beat_tolerance_usd: f64,
+    #[serde(default = "default_xrp_tolerance")]
+    pub xrp_price_to_beat_tolerance_usd: f64,
+    /// Seconds between polls when checking if markets are closed/resolved (e.g. 30).
+    #[serde(default = "default_resolution_poll_interval_secs")]
+    pub resolution_poll_interval_secs: u64,
+    /// Max seconds to wait for resolution before giving up (e.g. 600 = 10 min).
+    #[serde(default = "default_resolution_max_wait_secs")]
+    pub resolution_max_wait_secs: u64,
+    /// Automatically redeem winning tokens after resolution.
+    #[serde(default = "default_auto_redeem")]
+    pub auto_redeem: bool,
 }
 
 fn default_symbols() -> Vec<String> {
@@ -55,14 +64,42 @@ fn default_symbols() -> Vec<String> {
 fn default_sum_threshold() -> f64 {
     0.99
 }
-fn default_verify_fill_secs() -> u64 {
-    10
+fn default_trade_interval_secs() -> u64 {
+    60
 }
-fn default_pre_order_size() -> String {
+fn default_arb_shares() -> String {
     "10".to_string()
 }
-fn default_pre_order_side() -> String {
-    "favor".to_string()
+fn default_eth_tolerance() -> f64 {
+    1.0
+}
+fn default_sol_tolerance() -> f64 {
+    0.05
+}
+fn default_xrp_tolerance() -> f64 {
+    0.0003
+}
+fn default_resolution_poll_interval_secs() -> u64 {
+    30
+}
+fn default_resolution_max_wait_secs() -> u64 {
+    600
+}
+fn default_auto_redeem() -> bool {
+    true
+}
+
+impl StrategyConfig {
+    /// Price-to-beat tolerance (USD) for the given symbol.
+    pub fn price_to_beat_tolerance_for(&self, symbol: &str) -> f64 {
+        match symbol.to_lowercase().as_str() {
+            "btc" => self.btc_price_to_beat_tolerance_usd,
+            "eth" => self.eth_price_to_beat_tolerance_usd,
+            "sol" => self.sol_price_to_beat_tolerance_usd,
+            "xrp" => self.xrp_price_to_beat_tolerance_usd,
+            _ => 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,12 +150,16 @@ impl Default for Config {
             strategy: StrategyConfig {
                 symbols: default_symbols(),
                 sum_threshold: 0.99,
-                verify_fill_secs: 10,
+                trade_interval_secs: default_trade_interval_secs(),
                 simulation_mode: false,
-                pre_order_enabled: false,
-                pre_order_size: default_pre_order_size(),
-                pre_order_side: default_pre_order_side(),
-                pre_order_improve_ticks: 0,
+                arb_shares: default_arb_shares(),
+                btc_price_to_beat_tolerance_usd: 10.0,
+                eth_price_to_beat_tolerance_usd: default_eth_tolerance(),
+                sol_price_to_beat_tolerance_usd: default_sol_tolerance(),
+                xrp_price_to_beat_tolerance_usd: default_xrp_tolerance(),
+                resolution_poll_interval_secs: default_resolution_poll_interval_secs(),
+                resolution_max_wait_secs: default_resolution_max_wait_secs(),
+                auto_redeem: default_auto_redeem(),
             },
         }
     }
